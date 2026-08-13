@@ -1,0 +1,38 @@
+[package]
+name = "lua-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# Direct deps: we own the Lua VM and talk to upstreams via the mcp-client
+# crate. rmcp provides the CallToolRequestParams / CallToolResult types that
+# flow through the host-function bridge.
+mcp-client = { path = "../mcp-client" }
+rmcp.workspace = true
+
+mlua.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+futures.workspace = true
+tokio-util.workspace = true
+
+# RFC 6570 URI Template expansion for `_gateway.expand_template`.
+# Agents call `_gateway.expand_template({template = "...", params = {...}})`
+# from Lua; the host function parses via `UriTemplate::new`, expands via
+# `expand(values)`, then namespaces the result via `mcp_client::resource_uri`.
+# Any RFC 6570 level (`{var}`, `{+var}`, `{?q}`, `{var*}`) works out of
+# the box — this is why we take the crate dep instead of hand-rolling
+# Level-1 substitution.
+uri-template.workspace = true
+
+# Time formatting for `_gateway.rfc3339` and `_gateway.now_minus`.
+chrono.workspace = true
+
+[lints]
+workspace = true

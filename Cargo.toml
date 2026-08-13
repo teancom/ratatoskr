@@ -1,0 +1,151 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/gateway",
+    "crates/mcp-client",
+    "crates/lua-runtime",
+]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+license = "MIT"
+# 1.88 is required by uri-template 0.1 (see lua-runtime/Cargo.toml). We
+# have no external MSRV consumers — the gateway is built from source by
+# whoever runs it — so bumping to the latest published crate's floor is
+# fine and beats pinning old versions of our deps.
+rust-version = "1.88"
+
+[workspace.dependencies]
+# MCP SDK — pinned at 1.5.0, the latest published crate when this was adopted
+# (2026-04); bump deliberately, not incidentally.
+# `auth` is enabled because the gateway now supports OAuth 2.0 HTTP upstreams
+# (authorization-code + PKCE, discovery, dynamic client registration, and silent
+# token refresh) via rmcp's `AuthorizationManager`/`AuthClient`. It pulls in the
+# `oauth2` and `url` crates. `elicitation` and reqwest TLS variants remain off:
+# reqwest already gets a rustls backend transitively through the streamable-http
+# transport features, which is what HTTPS to the OAuth endpoints needs.
+rmcp = { version = "1.5", default-features = false, features = [
+    "auth",
+    "client",
+    "server",
+    "macros",
+    "base64",
+    "schemars",
+    "transport-child-process",
+    "transport-streamable-http-client-reqwest",
+    "transport-streamable-http-server",
+    "reqwest",
+] }
+
+# Lua runtime. `luau` gives us Luau with its VM-level sandbox (readonly globals,
+# interrupt hook for CPU bounding). `send` makes mlua::Lua Send+Sync so we can
+# move it across threads if needed. We deliberately DO NOT enable `async`:
+# execute scripts call upstream tools synchronously (no `:await()`), so the
+# async feature would only add VM/runtime entanglement without benefit.
+mlua = { version = "0.11", features = ["luau", "send", "serialize"] }
+
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+axum = "0.8"
+# HTTP types crate. rmcp's streamable-http transport accepts `HeaderName` /
+# `HeaderValue` in its custom_headers map; we need direct access to construct
+# them when wiring through per-upstream config headers.
+http = "1"
+anyhow = "1"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+# tracing-appender: daily rolling file writer + non_blocking wrapper.
+# `max_log_files` (0.2.3+) is the load-bearing feature — without it,
+# rotation without bounded retention is just a slower disk-space
+# footgun. We write to disk ONLY when --log-file is passed; default
+# stays stdout-only so the unconfigured case never touches disk.
+tracing-appender = "0.2"
+futures = "0.3"
+async-trait = "0.1"
+# reqwest is the concrete HTTP client rmcp's `auth` layer wants: its
+# `AuthorizationManager::with_client` / `AuthClient::new` are typed on
+# `reqwest::Client` (aliased `HttpClient` inside rmcp). We construct one in the
+# OAuth connect path. Pinned to match rmcp 1.5's reqwest (0.13) and given the
+# `rustls-tls` backend so HTTPS to the OAuth/token endpoints works without a
+# system OpenSSL. `default-features = false` keeps it lean — we only need the
+# JSON-less client; rmcp drives the request bodies.
+reqwest = { version = "0.13", default-features = false, features = [
+    "rustls",
+] }
+# UUIDs for execution IDs. v4 gives a random ID per `execute` call with
+# no coordination; 128 bits of entropy is plenty to avoid any realistic
+# collision in a session's storage lifetime.
+uuid = { version = "1", features = ["v4"] }
+
+# Test-only: isolated, auto-cleaned temp directories. Used by credential-store
+# and OAuth integration tests that need a clean filesystem sandbox per test.
+tempfile = "3"
+
+# Unix signal handling from safe Rust. Used by the `login` subcommand to send
+# SIGHUP to the running gateway (config hot-reload) and to liveness-probe its
+# PID. Preferred over raw `libc` so we stay inside the workspace-wide
+# `unsafe_code = "forbid"` lint — nix wraps the unsafe syscalls.
+nix = { version = "0.31", features = ["signal"] }
+
+# RFC 6570 URI Template parsing + expansion for the namespaced resources
+# feature. The gateway namespaces upstream resource templates (e.g.
+# `incident://{incident_id}`) as `mcp-proxy://<lua_name>/<encoded>` and
+# exposes a Lua builtin `_gateway.expand_template(...)` that fills a
+# template with caller-supplied params. Going through a proper RFC 6570
+# expander (rather than naive `gsub`) means Level 2-4 templates from a
+# future upstream just work — not only the Level 1 `{var}` shape that
+# Rootly ships today.
+#
+# `serde` feature is on so we can build `Value` instances from a
+# `serde_json::Value` via `deserialize_owned_value`. Without serde, the
+# only paths to constructing `Value::List` / `Value::Keys` are
+# `From<Vec<T>>` (lists only) or `From<&[(K, V)]>` (borrowed-lifetime
+# keys only) — neither works for Keys built at runtime without naming
+# the crate-private `Scalar` type.
+uri-template = { version = "0.1", features = ["serde"] }
+
+# Percent-encoding for the namespaced-resource URI codec. The upstream
+# URI gets encoded into the path component of `mcp-proxy://<lua_name>/...`
+# so that arbitrary upstream URI shapes (containing `/`, `?`, `#`, `%`,
+# or UTF-8) roundtrip cleanly. Already pulled in transitively by several
+# deps; we take a direct dependency here so the dedicated codec file
+# (`crates/mcp-client/src/resource_uri.rs`) can reference the crate by
+# name.
+percent-encoding = "2"
+
+# Date/time for the `_gateway.rfc3339` / `_gateway.now_minus` Lua
+# builtins. This exists so agents don't have to reinvent
+# `os.date("!%Y-%m-%dT%H:%M:%SZ", ...)` helpers across Grafana/Loki,
+# Datadog, and every other time-windowed upstream. We surface the
+# RFC3339-UTC shape as a Lua builtin rather than rolling our own
+# Gregorian math — leap years and epoch edge cases are nobody's
+# problem when chrono already handles them.
+#
+# `clock` is on (default) because `_gateway.now_minus` needs
+# `Utc::now()`. Other default features stay enabled; they add negligible
+# weight for a non-WASM target.
+chrono = "0.4"
+
+# Release builds keep optimisations but emit full DWARF debug info so
+# lldb can resolve PC → file:line AND give us local variable names on
+# backtraces. The gateway is built from source on the box that runs it,
+# so post-mortem debugging happens where the binary was built — no
+# reason to pay the line-tables-only tradeoff.
+[profile.release]
+debug = true
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+unused_must_use = "deny"
+
+[workspace.lints.clippy]
+# Opinionated defaults that match house style (fail-loud, no sloppy error handling)
+todo = "warn"
+dbg_macro = "warn"
+unwrap_used = "warn"
+# These help enforce FCIS discipline at the clippy level:
+# explicit `.unwrap()` in shell code with context is fine; in core, it's a smell.

@@ -1,0 +1,54 @@
+[package]
+name = "gateway"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "rato"
+path = "src/main.rs"
+
+[dependencies]
+mcp-client = { path = "../mcp-client" }
+lua-runtime = { path = "../lua-runtime" }
+
+rmcp.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+axum.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tracing-appender.workspace = true
+async-trait.workspace = true
+http.workspace = true
+futures.workspace = true
+uuid.workspace = true
+# OAuth login subcommand: reqwest is the HTTP client rmcp's auth layer drives;
+# percent-encoding decodes the `code`/`state` query params from the browser
+# redirect.
+reqwest.workspace = true
+percent-encoding.workspace = true
+
+# Unix-only: the `login` subcommand sends SIGHUP to the running gateway to
+# trigger a config hot-reload after a successful OAuth login, and liveness-
+# probes its PID first. `nix` wraps the unsafe syscalls so we stay inside the
+# workspace `unsafe_code = "forbid"` lint.
+[target.'cfg(unix)'.dependencies]
+nix.workspace = true
+
+[dev-dependencies]
+# Integration tests check process aliveness via kill(pid, 0) and send signals.
+# Prefer `nix` over raw `libc` so we stay inside the workspace-wide
+# `unsafe_code = "forbid"` lint — nix wraps the unsafe syscalls for us.
+nix.workspace = true
+# OAuth integration test: a fake authorization server stood up in-process with
+# axum, plus an isolated temp credential dir.
+tempfile.workspace = true
+
+[lints]
+workspace = true

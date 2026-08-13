@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Example launchd agent for the Ratatoskr gateway.
+
+  Install: replace /Users/YOU with your home directory (launchd does not
+  expand ~ or environment variables in these paths), then copy to:
+
+    ~/Library/LaunchAgents/local.ratatoskr.plist
+
+  scripts/deploy.sh expects exactly that label and location; it handles
+  the bootout/bootstrap cycle for you on every deploy. For a first-time
+  manual start:
+
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/local.ratatoskr.plist
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>local.ratatoskr</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/YOU/.local/bin/rato</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>/Users/YOU/Library/Logs/ratatoskr.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/YOU/Library/Logs/ratatoskr.log</string>
+</dict>
+</plist>

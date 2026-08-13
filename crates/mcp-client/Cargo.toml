@@ -1,0 +1,51 @@
+[package]
+name = "mcp-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+rmcp.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+async-trait.workspace = true
+http.workspace = true
+
+# Concrete HTTP client for the OAuth connect path. rmcp's
+# `AuthorizationManager`/`AuthClient` are typed on `reqwest::Client`, so we
+# construct one here and hand it in. See workspace Cargo.toml for the TLS
+# backend rationale.
+reqwest.workspace = true
+
+# Percent-encoding for the namespaced-resource URI codec
+# (`src/resource_uri.rs`). Lives in this crate rather than `gateway`
+# because `lua-runtime` needs to import the codec for its
+# `_gateway.expand_template` builtin, and the dependency direction
+# `lua-runtime -> gateway` is forbidden (same rule as
+# `ExecutionResultBackend`).
+percent-encoding.workspace = true
+
+# rmcp uses process-wrap internally for TokioChildProcess. We depend on it
+# directly here to wrap commands with ProcessGroup::leader() before passing
+# them to rmcp — this makes SIGTERM propagate to the whole subtree rather
+# than just the immediate child.
+process-wrap = { version = "9", features = ["tokio1"] }
+
+[dev-dependencies]
+# For the template-matcher roundtrip test: we lean on the same expander
+# the gateway uses in production (`_gateway.expand_template`) as an
+# oracle for "what does a valid expansion look like?" rather than
+# writing two implementations of RFC 6570 expansion and diffing them.
+uri-template.workspace = true
+# Isolated temp dirs for the credential-store tests (file mode, atomic write,
+# concurrent save/load).
+tempfile.workspace = true
+
+[lints]
+workspace = true

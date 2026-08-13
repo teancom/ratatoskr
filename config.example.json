@@ -1,0 +1,83 @@
+{
+  "//": "Ratatoskr gateway config. Default location on macOS:",
+  "//1": "  ~/Library/Preferences/ratatoskr/config.json",
+  "//2": "(or set $RATO_CONFIG_PATH). Keys starting with '//' are ignored,",
+  "//3": "as is any unrecognized key. See README.md > Configuration.",
+
+  "port": 8910,
+  "resultSizeThreshold": 50000,
+  "executeDeadlineMs": 60000,
+
+  "upstreamSupervision": {
+    "//": "Gateway-wide supervisor defaults; every field optional.",
+    "callTimeoutMs": 20000,
+    "unhealthyThreshold": 3,
+    "activePingIntervalMs": 30000,
+    "activePingTimeoutMs": 5000,
+    "respawnMaxAttempts": 5,
+    "respawnBackoffBaseMs": 1000,
+    "respawnBackoffCapMs": 30000,
+    "deadRearmIntervalMs": 300000
+  },
+
+  "mcpClients": {
+    "filesystem": {
+      "//": "stdio upstream: the gateway spawns and supervises the process.",
+      "type": "stdio",
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/Users/YOU/Documents"],
+      "hint": "Read/write files under ~/Documents"
+    },
+
+    "GitLab": {
+      "//": "Containerized stdio upstream. The gateway injects",
+      "//1": "'--name rato-GitLab' so orphans are visible and reaped.",
+      "type": "stdio",
+      "command": "podman",
+      "args": [
+        "run", "-i", "--rm",
+        "-e", "GITLAB_TOKEN",
+        "registry.example.com/mcp/gitlab-mcp:latest",
+        "--base-url", "https://gitlab.example.com/"
+      ],
+      "env": { "GITLAB_TOKEN": "glpat-REPLACE-ME" },
+      "hint": "GitLab MRs, pipelines, issues, and repo files on gitlab.example.com",
+      "supervision": {
+        "//": "Per-upstream override, layered over upstreamSupervision.",
+        "callTimeoutMs": 60000
+      }
+    },
+
+    "rootly": {
+      "//": "Plain HTTP upstream with a static API-key header.",
+      "type": "http",
+      "url": "https://mcp.rootly.com/mcp",
+      "headers": { "Authorization": "Bearer rootly-api-key-REPLACE-ME" },
+      "hint": "Rootly incidents, action items, and alerts"
+    },
+
+    "Datadog": {
+      "//": "OAuth upstream (authorization-code + PKCE). No 'headers' here —",
+      "//1": "the OAuth layer owns the Authorization header. Authorize once with:",
+      "//2": "  rato login Datadog",
+      "//3": "Credentials persist under ~/Library/Application Support/ratatoskr/",
+      "//4": "and refresh silently afterwards.",
+      "type": "http-oauth",
+      "url": "https://mcp.datadoghq.com/api/unstable/mcp-server/mcp",
+      "scopes": [],
+      "hint": "Datadog logs, metrics, monitors, and service catalog"
+    },
+
+    "Slack": {
+      "//": "OAuth upstream for a provider that prohibits dynamic client",
+      "//1": "registration: pass the pre-registered clientId. callbackPort",
+      "//2": "pins the localhost redirect for strict redirect-URI allowlists.",
+      "type": "http-oauth",
+      "url": "https://mcp.slack.com/mcp",
+      "clientId": "your-preregistered-client-id",
+      "callbackPort": 3118,
+      "scopes": [],
+      "hint": "Slack channels, messages, and search"
+    }
+  }
+}
