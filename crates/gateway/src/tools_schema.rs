@@ -64,7 +64,9 @@ pub fn list_servers_tool() -> Tool {
     Tool::new(
         "list-servers",
         "List the upstream MCP servers this gateway fronts — each with a one-line hint \
-         describing what it's for. These upstreams are NOT in your flat tool list; this \
+         describing what it's for. Includes configured but disconnected upstreams, their \
+         latest bounded redacted connection diagnostics, and exact reconnect-upstream arguments. \
+         Disconnected entries are not callable in execute. These upstreams are NOT in your flat tool list; this \
          is the only way to discover them. Call this BEFORE authenticating, setting up, \
          or starting an OAuth flow on any same-named tool in your flat list: such a tool \
          is frequently a redundant, unauthenticated duplicate of an upstream already \
@@ -207,7 +209,7 @@ pub fn reconnect_upstream_tool() -> Tool {
             "properties": {
                 "luaServerName": {
                     "type": "string",
-                    "description": "The sanitized Lua name of the upstream server to reconnect (see list-servers for the catalog)."
+                    "description": "The sanitized Lua name of the upstream server to reconnect. Accepts configured upstreams even if their initial connection failed and they are absent from list-servers. Retry to obtain the connection/startup diagnostic."
                 }
             },
             "required": ["luaServerName"],

@@ -12,6 +12,7 @@ pub mod reauth_notify;
 pub mod resource_list_cache;
 pub mod resource_uri;
 pub mod sampling;
+mod startup_stderr;
 pub mod supervision;
 pub mod supervisor;
 pub mod template_matcher;

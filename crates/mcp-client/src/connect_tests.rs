@@ -3,6 +3,73 @@ use crate::sampling::SamplingBroker;
 use crate::upstream::UpstreamConfig;
 use std::time::Instant;
 
+// Pins actionable launcher stderr in connection errors without leaking configured credentials.
+#[cfg(unix)]
+#[tokio::test]
+async fn stdio_failure_includes_redacted_launcher_diagnostics() {
+    let bus = UpstreamEventBus::new();
+    let broker: SharedSamplingBroker = Arc::new(SamplingBroker::new());
+    let config = UpstreamConfig::new(
+        "launcher", "launcher",
+        UpstreamKind::Stdio {
+            command: "/bin/sh".to_string(),
+            args: vec!["-c".to_string(), "printf '%s\\n' 'launcher: run ride-cli login to renew session' \"$TEST_CREDENTIAL\" 'Authorization: Bearer raw-bearer-value' >&2; exit 1".to_string()],
+            env: HashMap::from([("TEST_CREDENTIAL".to_string(), "opaque-secret-value".to_string())]),
+        },
+    );
+    let result = tokio::time::timeout(Duration::from_secs(3), connect(&config, &bus, &broker))
+        .await
+        .expect("failed launcher must return promptly");
+    match result {
+        Err(UpstreamError::Connect { name, source }) => {
+            assert_eq!(name, "launcher");
+            let text = source.to_string();
+            assert!(
+                text.contains("launcher: run ride-cli login to renew session"),
+                "{text}"
+            );
+            assert!(!text.contains("opaque-secret-value"), "{text}");
+            assert!(!text.contains("raw-bearer-value"), "{text}");
+        }
+        Err(other) => panic!("expected Connect, got {other:?}"),
+        Ok(_) => panic!("launcher unexpectedly connected"),
+    }
+}
+
+// Pins child ownership and continued stderr draining after a successful handshake.
+#[cfg(unix)]
+#[tokio::test]
+async fn stdio_success_survives_stderr_pressure() {
+    let config = UpstreamConfig::new("healthy", "healthy", UpstreamKind::Stdio {
+        command: "/bin/sh".to_string(),
+        args: vec!["-c".to_string(), r#"
+read -r initialize
+printf '%s\n' '{"jsonrpc":"2.0","id":0,"result":{"protocolVersion":"2025-03-26","capabilities":{},"serverInfo":{"name":"test","version":"1"}}}'
+read -r initialized
+i=0
+while [ "$i" -lt 10000 ]; do printf '%s\n' 'healthy server stderr chatter' >&2; i=$((i+1)); done
+read -r ping
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{}}'
+read -r wait_for_close
+"#.to_string()],
+        env: HashMap::new(),
+    });
+    let bus = UpstreamEventBus::new();
+    let broker: SharedSamplingBroker = Arc::new(SamplingBroker::new());
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let live = connect(&config, &bus, &broker).await.expect("handshake");
+        live.peer()
+            .send_request(rmcp::model::ClientRequest::PingRequest(
+                rmcp::model::PingRequest::default(),
+            ))
+            .await
+            .expect("child still serves requests after stderr pressure");
+        live.close().await.expect("close connection");
+    })
+    .await
+    .expect("stderr pipe must not block successful child");
+}
+
 /// An OAuth upstream with no persisted credentials must fail with the
 /// actionable [`UpstreamError::OAuthLoginRequired`] — and must do so
 /// *fast*, before any network I/O. We point it at an empty state dir

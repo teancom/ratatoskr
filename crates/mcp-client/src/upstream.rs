@@ -874,6 +874,8 @@ pub fn is_auth_failure(err: &(dyn std::error::Error + 'static)) -> bool {
 struct Registry {
     by_name: HashMap<String, Arc<UpstreamHandle>>,
     by_lua_name: HashMap<String, Arc<UpstreamHandle>>,
+    configured: Option<Vec<UpstreamConfig>>,
+    connection_errors: HashMap<String, String>,
 }
 
 /// Session-scoped registry of upstream connections.
@@ -888,6 +890,43 @@ pub struct UpstreamManager {
 impl UpstreamManager {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Publish the last successfully parsed configuration, not an on-disk view.
+    /// Removed entries lose diagnostics; late retries cannot resurrect them.
+    pub async fn set_configured(&self, configs: Vec<UpstreamConfig>) {
+        let mut guard = self.inner.write().await;
+        guard
+            .connection_errors
+            .retain(|name, _| configs.iter().any(|c| &c.name == name));
+        guard.configured = Some(configs);
+    }
+
+    /// Configured discovery is separate from the live-only execution registry.
+    pub async fn configured(&self) -> Vec<UpstreamConfig> {
+        let guard = self.inner.read().await;
+        guard
+            .configured
+            .clone()
+            .unwrap_or_else(|| guard.by_name.values().map(|h| h.config.clone()).collect())
+    }
+
+    pub async fn record_connection_error(&self, config: &UpstreamConfig, error: &str) {
+        let diagnostic = crate::startup_stderr::connection_diagnostic(config, error);
+        let mut guard = self.inner.write().await;
+        if guard
+            .configured
+            .as_ref()
+            .is_none_or(|configs| configs.contains(config))
+        {
+            guard
+                .connection_errors
+                .insert(config.name.clone(), diagnostic);
+        }
+    }
+
+    pub async fn connection_error(&self, name: &str) -> Option<String> {
+        self.inner.read().await.connection_errors.get(name).cloned()
     }
 
     /// Register a handle under both its display `name` and its sanitized
@@ -947,6 +986,7 @@ impl UpstreamManager {
             guard.by_name.remove(&displaced_name);
         }
 
+        guard.connection_errors.remove(&name);
         guard.by_name.insert(name, Arc::clone(&handle));
         guard.by_lua_name.insert(lua_name, handle);
     }
@@ -1074,6 +1114,7 @@ impl UpstreamManager {
         }
 
         let new_lua_name = new_handle.config.lua_name.clone();
+        guard.connection_errors.remove(name);
         guard
             .by_name
             .insert(name.to_string(), Arc::clone(&new_handle));
@@ -1141,6 +1182,7 @@ impl UpstreamManager {
                 .by_name
                 .insert(name.to_string(), Arc::clone(&new_handle));
             guard.by_lua_name.insert(new_lua_name, new_handle);
+            guard.connection_errors.remove(name);
             tracing::info!(
                 upstream = %name,
                 "upstream handle replaced (register_or_replace; existing name)"
@@ -1165,6 +1207,7 @@ impl UpstreamManager {
             .by_name
             .insert(name.to_string(), Arc::clone(&new_handle));
         guard.by_lua_name.insert(new_lua_name, new_handle);
+        guard.connection_errors.remove(name);
         tracing::info!(
             upstream = %name,
             "upstream handle registered (register_or_replace; fresh insertion)"
@@ -1184,6 +1227,7 @@ impl UpstreamManager {
     /// `by_lua_name` is evicted alongside `by_name`.
     pub async fn remove(&self, name: &str) -> Option<Arc<UpstreamHandle>> {
         let mut guard = self.inner.write().await;
+        guard.connection_errors.remove(name);
         let removed = guard.by_name.remove(name)?;
         let lua_name = removed.config.lua_name.clone();
         guard.by_lua_name.remove(&lua_name);

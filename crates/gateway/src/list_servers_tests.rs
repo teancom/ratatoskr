@@ -195,6 +195,28 @@ fn multiple_hints_each_attach_to_their_own_server() {
 // ---- Health annotation tests ----
 
 #[test]
+fn failed_replacement_retains_live_health_and_sorted_order() {
+    // Property: a retained old handle is not mislabeled disconnected, and sorting is stable.
+    let z = stdio("zeta", "zeta");
+    let a = stdio("alpha", "alpha");
+    let out = render(
+        &[
+            CatalogEntry::new(&z, None).with_connection_error(Some("launcher failed")),
+            CatalogEntry::new(&a, None)
+                .with_health(Some(snap(HealthState::Suspect, 1, Some(30))))
+                .with_connection_error(Some("replacement failed")),
+        ],
+        fixed_now(),
+    );
+    assert!(out.find("## alpha").expect("alpha") < out.find("## zeta").expect("zeta"));
+    let alpha = out.split("## zeta").next().expect("first entry");
+    assert!(alpha.contains("Previous connection retained"));
+    assert!(alpha.contains("Suspect"));
+    assert!(!alpha.contains("Disconnected"));
+    assert!(out.contains("reconnect-upstream with {\"luaServerName\":\"alpha\"}"));
+}
+
+#[test]
 fn healthy_state_renders_no_health_tag() {
     // Property: a Healthy upstream looks exactly like one with no
     // health snapshot at all. Absence-of-tag is the all-clear

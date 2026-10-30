@@ -74,15 +74,10 @@ impl GatewayHandler {
         request: &CallToolRequestParams,
     ) -> Result<CallToolResult, ErrorData> {
         let lua_server_name = parse_string_arg(request, "luaServerName")?;
-        // Resolve BEFORE reconciling so an unknown name is a crisp
-        // invalid_params instead of a silently-ignored force entry.
-        let handle = self.require_upstream_by_lua_name(&lua_server_name).await?;
-        let display_name = handle.config.name.clone();
-        drop(handle);
-
-        let force: std::collections::HashSet<String> =
-            std::iter::once(display_name.clone()).collect();
-        let text = match serve::reconcile_from_disk_forcing(&self.state.ctx, force).await {
+        let (display_name, result) = serve::reconnect_from_disk(&self.state.ctx, &lua_server_name)
+            .await
+            .map_err(|message| ErrorData::invalid_params(message, None))?;
+        let text = match result {
             serve::ReconcileResult::ParseError(e) => format!(
                 "Upstream NOT reconnected — the config file is missing or invalid, so nothing \
                  was changed. Fix the config (or restore it) and retry.\n\nError: {e}"
@@ -90,7 +85,13 @@ impl GatewayHandler {
             serve::ReconcileResult::Applied {
                 outcome,
                 settings_lines,
-            } => render_reconnect_report(&display_name, &outcome, &settings_lines),
+            } => render_reconnect_report(
+                display_name
+                    .as_deref()
+                    .expect("applied reconnect has a resolved target"),
+                &outcome,
+                &settings_lines,
+            ),
         };
 
         Ok(CallToolResult::success(vec![Content::text(text)]))

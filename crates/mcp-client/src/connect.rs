@@ -63,6 +63,7 @@ pub enum LiveUpstream {
         service: RunningService<RoleClient, Box<dyn DynService<RoleClient>>>,
         pid: Option<u32>,
         health: Arc<UpstreamHealth>,
+        stderr: crate::startup_stderr::StartupStderr,
     },
     Http {
         service: RunningService<RoleClient, Box<dyn DynService<RoleClient>>>,
@@ -98,15 +99,19 @@ impl LiveUpstream {
     }
 
     pub async fn close(self) -> anyhow::Result<()> {
-        match self {
-            LiveUpstream::Stdio { service, .. } | LiveUpstream::Http { service, .. } => {
-                service
-                    .cancel()
-                    .await
-                    .map_err(|e| anyhow::anyhow!("cancel failed: {e}"))?;
-            }
-        }
-        Ok(())
+        let (service, stderr) = match self {
+            LiveUpstream::Stdio {
+                service, stderr, ..
+            } => (service, Some(stderr)),
+            LiveUpstream::Http { service, .. } => (service, None),
+        };
+        // Keep draining until cancellation finishes; shutdown can emit stderr too.
+        let result = service
+            .cancel()
+            .await
+            .map_err(|e| anyhow::anyhow!("cancel failed: {e}"));
+        drop(stderr);
+        result.map(|_| ())
     }
 }
 
@@ -213,15 +218,33 @@ pub async fn connect(
             let mut wrapped = CommandWrap::from(cmd);
             wrapped.wrap(ProcessGroup::leader());
 
-            let transport =
-                TokioChildProcess::new(wrapped).map_err(|source| UpstreamError::StdioSpawn {
+            let (transport, stderr) = TokioChildProcess::builder(wrapped)
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .map_err(|source| UpstreamError::StdioSpawn {
                     name: config.name.clone(),
                     source,
                 })?;
-
+            let mut stderr = crate::startup_stderr::StartupStderr::spawn(
+                stderr.expect("piped stderr is available after spawn"),
+            );
+            let secrets = crate::startup_stderr::secrets(env, &effective_args);
             let pid = transport.id();
 
-            let service = serve_and_handshake(handler, transport, &config.name).await?;
+            let service = match serve_and_handshake(handler, transport, &config.name).await {
+                Ok(service) => service,
+                Err(UpstreamError::Connect { name, source }) => {
+                    let diagnostic = stderr.diagnostic(&secrets).await;
+                    let source = if diagnostic.is_empty() {
+                        source
+                    } else {
+                        anyhow::anyhow!("{source}; startup stderr:\n{diagnostic}")
+                    };
+                    return Err(UpstreamError::Connect { name, source });
+                }
+                Err(other) => return Err(other),
+            };
+            stderr.connected();
 
             info!(
                 name = %config.name,
@@ -234,6 +257,7 @@ pub async fn connect(
                 service,
                 pid,
                 health,
+                stderr,
             })
         }
 

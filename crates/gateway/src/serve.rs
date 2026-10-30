@@ -928,6 +928,11 @@ async fn http_bootstrap_retry_loop(
                 return;
             }
             Err(e) => {
+                if let Some(manager) = upstreams.upgrade() {
+                    manager
+                        .record_connection_error(&config, &e.to_string())
+                        .await;
+                }
                 // An actionable-precondition failure (OAuth not logged in)
                 // is operator-fixable, not a transient network blip — flag
                 // it distinctly so the log reads as "do this" rather than
@@ -1136,6 +1141,7 @@ where
     Fut: Future<Output = Result<LiveUpstream, UpstreamError>>,
 {
     let manager = UpstreamManager::new();
+    manager.set_configured(configs.clone()).await;
     let mut succeeded = 0usize;
     let mut failed_configs: Vec<UpstreamConfig> = Vec::new();
 
@@ -1169,6 +1175,9 @@ where
                     error = %e,
                     "upstream failed to connect; will retry asynchronously"
                 );
+                manager
+                    .record_connection_error(&config, &e.to_string())
+                    .await;
                 failed_configs.push(config);
             }
         }
@@ -1313,6 +1322,9 @@ where
                 outcome.connected.push(config);
             }
             (Err(e), true) => {
+                ctx.upstreams
+                    .record_connection_error(&config, &e.to_string())
+                    .await;
                 tracing::warn!(name = %name, error = %e, "reload: added upstream failed to connect");
                 outcome.failed.push((name, e.to_string()));
             }
@@ -1348,6 +1360,9 @@ where
                 }
             }
             (Err(e), false) => {
+                ctx.upstreams
+                    .record_connection_error(&config, &e.to_string())
+                    .await;
                 // Connect-new-first paid off: the old upstream is still
                 // registered and supervised. Report and move on.
                 tracing::warn!(
@@ -1509,18 +1524,62 @@ pub async fn reconcile_from_disk_forcing(
     ctx: &AppContext,
     force_reconnect: std::collections::HashSet<String>,
 ) -> ReconcileResult {
+    reconcile_from_disk_inner(ctx, force_reconnect, None, reload_parse_config)
+        .await
+        .expect("unnamed reconciliation cannot fail name resolution")
+        .1
+}
+
+/// Resolve a reconnect target from the same disk snapshot that is reconciled.
+/// Validation and parsing finish before any upstream mutation, under the reload lock.
+pub async fn reconnect_from_disk(
+    ctx: &AppContext,
+    lua_name: &str,
+) -> Result<(Option<String>, ReconcileResult), String> {
+    reconcile_from_disk_inner(
+        ctx,
+        std::collections::HashSet::new(),
+        Some(lua_name),
+        reload_parse_config,
+    )
+    .await
+}
+
+async fn reconcile_from_disk_inner(
+    ctx: &AppContext,
+    mut force_reconnect: std::collections::HashSet<String>,
+    lua_name: Option<&str>,
+    load_config: impl FnOnce() -> Result<(Vec<UpstreamConfig>, config::GatewaySettings)>,
+) -> Result<(Option<String>, ReconcileResult), String> {
     // Serialize reloads: two callers (two MCP sessions, or an MCP session
     // and a SIGHUP) would otherwise race on list → diff → mutate.
     let _guard = ctx.reload_lock.lock().await;
 
     // Parse first. On ANY error, change nothing and report verbatim.
-    let (next_upstreams, parsed_settings) = match reload_parse_config() {
+    let (next_upstreams, parsed_settings) = match load_config() {
         Ok(parsed) => parsed,
-        Err(e) => return ReconcileResult::ParseError(format!("{e:#}")),
+        Err(e) => return Ok((None, ReconcileResult::ParseError(format!("{e:#}")))),
     };
 
     let current = ctx.upstreams.list().await;
+    // Include disconnected configured entries in removals so their retry tasks
+    // are cancelled even though no live handle exists.
+    let previous_configured = ctx.upstreams.configured().await;
+    let target = lua_name
+        .map(|name| crate::reconcile::resolve_upstream_name(name, &current, &next_upstreams))
+        .transpose()?;
+    if let Some(name) = &target {
+        force_reconnect.insert(name.clone());
+    }
     let mut diff = crate::reconcile::diff_upstreams(&current, &next_upstreams);
+    for config in previous_configured {
+        if !next_upstreams.iter().any(|c| c.name == config.name)
+            && !diff.removed.contains(&config.name)
+        {
+            diff.removed.push(config.name);
+        }
+    }
+    ctx.upstreams.set_configured(next_upstreams).await;
 
     // Force-reconnect any upstream sitting in NeedsLogin. Its config is
     // unchanged (login only rewrote credentials on disk, not the config),
@@ -1564,10 +1623,13 @@ pub async fn reconcile_from_disk_forcing(
     let supervisor_parent = ctx.supervisor_cancel.clone();
     let _handles = spawn_supervisors_for(ctx, &supervisor_parent, outcome.connected.clone()).await;
 
-    ReconcileResult::Applied {
-        outcome,
-        settings_lines,
-    }
+    Ok((
+        target,
+        ReconcileResult::Applied {
+            outcome,
+            settings_lines,
+        },
+    ))
 }
 
 /// Collect the display names of all currently-registered upstreams whose
@@ -1694,3 +1756,7 @@ fn build_session_manager() -> LocalSessionManager {
 #[cfg(test)]
 #[path = "serve_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "connection_catalog_tests.rs"]
+mod connection_catalog_tests;

@@ -29,10 +29,10 @@ use mcp_client::{HealthSnapshot, HealthState, UpstreamConfig, UpstreamKind};
 pub struct CatalogEntry<'a> {
     pub config: &'a UpstreamConfig,
     pub hint: Option<&'a str>,
-    /// Health snapshot, if the handler was able to capture one. `None`
-    /// when the upstream isn't registered (should be rare; if this is
-    /// happening at render time, something's wrong with bootstrap).
+    /// Live health snapshot. `None` means configured but disconnected;
+    /// discovery includes entries whose initial connection has failed.
     pub health: Option<HealthSnapshot>,
+    pub connection_error: Option<&'a str>,
 }
 
 impl<'a> CatalogEntry<'a> {
@@ -41,7 +41,13 @@ impl<'a> CatalogEntry<'a> {
             config,
             hint,
             health: None,
+            connection_error: None,
         }
+    }
+
+    pub fn with_connection_error(mut self, error: Option<&'a str>) -> Self {
+        self.connection_error = error;
+        self
     }
 
     pub fn with_health(mut self, health: Option<HealthSnapshot>) -> Self {
@@ -87,6 +93,18 @@ pub fn render(entries: &[CatalogEntry<'_>], now: SystemTime) -> String {
             "## {} (Lua: {}) [{}]{}\n",
             cfg.name, cfg.lua_name, kind_label, health_tag
         ));
+        if entry.health.is_none() {
+            out.push_str("   status: Disconnected — configured, not callable in execute\n");
+        } else if entry.connection_error.is_some() {
+            out.push_str("   status: Previous connection retained after failed replacement; live health shown above\n");
+        }
+        if let Some(error) = entry.connection_error {
+            out.push_str(&format!("   latest connection diagnostic: {error}\n"));
+        }
+        if entry.health.is_none() || entry.connection_error.is_some() {
+            let args = serde_json::json!({"luaServerName": cfg.lua_name});
+            out.push_str(&format!("   retry: call reconnect-upstream with {args}\n"));
+        }
         if let Some(hint) = entry.hint.filter(|h| !h.is_empty()) {
             out.push_str(&format!("   hint: {hint}\n"));
         }

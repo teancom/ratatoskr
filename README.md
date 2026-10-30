@@ -21,14 +21,14 @@ The tool surface:
 
 | Tool | Purpose |
 |---|---|
-| `list-servers` | Catalog of configured upstreams, one hint line each, plus health |
+| `list-servers` | Catalog of configured upstreams, including disconnected entries, hints, health, and safe connection diagnostics |
 | `server-details` | One upstream's identity + full advertised instructions |
 | `list-server-tools` | Compact tool summary for one upstream |
 | `tool-details` | Full schema for one tool (required before calling it) |
 | `inspect-tool-response` | Call a tool once, verbatim, to observe its response shape |
 | `execute` | Run a Luau script that calls upstream tools synchronously |
 | `reload-config` | Hot-apply config file changes (add/remove/change upstreams) |
-| `reconnect-upstream` | Tear down and re-establish one upstream connection |
+| `reconnect-upstream` | Retry a configured upstream, including one that failed to start |
 | `restart-gateway` | Clean process restart (picks up gateway-wide settings) |
 | `ping` | Liveness check |
 
@@ -56,6 +56,23 @@ Other features:
 - **Container hygiene** — `podman run` / `docker run` upstreams get a
   deterministic `--name rato-<Name>` injected, so orphans are visible
   (`podman ps` filter `^rato-`) and reaped before respawn.
+
+## Recovering a failed stdio upstream
+
+When a launcher exits before the MCP handshake, connection errors include a
+bounded, credential-redacted excerpt of its stderr. Launchers should keep stdout
+reserved for MCP and write a short, actionable diagnostic to stderr. Do not print
+credentials or raw authentication responses.
+
+After taking the action in the diagnostic, call `reconnect-upstream` with the
+configured server's `luaServerName`. This also works when the server failed at
+startup and has no live connection. A failed replacement leaves an existing
+connection running.
+
+The example `scripts/argocd-mcp-launcher.sh` distinguishes expired authentication
+from connectivity or unclassified failures. Confirmed authentication failures
+print the `argocd login` command and the instruction to reconnect afterward.
+Run its mock-based checks with `bash scripts/test-argocd-mcp-launcher.sh`.
 
 ## Installation
 
@@ -257,6 +274,15 @@ lsof -nP -iTCP:8910 -sTCP:LISTEN               # who holds the port
 A crash-looping service under `KeepAlive` is usually `EADDRINUSE`: an
 orphaned gateway still holds the port. `scripts/deploy.sh` detects and
 names the culprit PID; kill it and redeploy.
+
+`list-servers` uses the last successfully applied configuration, not an unvalidated
+on-disk edit. Configured upstreams whose initial connection failed remain visible as
+**Disconnected** (not callable in `execute`), with the latest safe connection
+diagnostic and exact `reconnect-upstream` arguments. Failed replacements show the
+previous connection as retained, separately from its live health. Diagnostics clear
+on successful connection or configuration removal. Stdio diagnostics are bounded
+and conservatively redacted; raw HTTP transport errors are withheld because they
+can contain response bodies or credentials.
 
 **An upstream is broken.** Ask the gateway first: `list-servers`
 reports per-upstream health (consecutive ping failures, respawn state,

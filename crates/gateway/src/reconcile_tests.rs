@@ -27,6 +27,54 @@ fn added_names(diff: &UpstreamDiff) -> Vec<String> {
 }
 
 #[test]
+fn reconnect_resolves_configured_without_live_handle_and_uses_runtime_sanitizer() {
+    let configured = vec![stdio(
+        "Example.Server-Name",
+        "stale_cached_name",
+        "missing-command",
+    )];
+    let lua_name = lua_runtime::sanitize_lua_identifier(&configured[0].name);
+    let target = resolve_upstream_name(&lua_name, &[], &configured).expect("configured target");
+    assert_eq!(target, "Example.Server-Name");
+    let mut diff = diff_upstreams(&[], &configured);
+    promote_for_reconnect(&mut diff, &[], &force(&[&target]));
+    assert_eq!(added_names(&diff), vec![target]);
+}
+
+#[test]
+fn reconnect_resolver_deduplicates_snapshots_and_retains_live_only_names() {
+    let live = vec![stdio("my-server", "my_server", "command")];
+    assert_eq!(
+        resolve_upstream_name("my_server", &live, &live),
+        Ok("my-server".into())
+    );
+    assert_eq!(
+        resolve_upstream_name("my_server", &live, &[]),
+        Ok("my-server".into())
+    );
+}
+
+#[test]
+fn reconnect_resolver_rejects_collision_across_live_and_disk() {
+    let live = vec![stdio("my-server", "my_server", "command")];
+    let configured = vec![stdio("my.server", "my_server", "command")];
+    let error = resolve_upstream_name("my_server", &live, &configured).expect_err("ambiguous");
+    assert_eq!(
+        error,
+        "ambiguous upstream server: my_server; display names my-server, my.server sanitize to the same Lua name; rename an upstream in the config before retrying"
+    );
+}
+
+#[test]
+fn reconnect_unknown_lists_available_lua_names() {
+    let configured = vec![stdio("my-server", "my_server", "command")];
+    assert_eq!(
+        resolve_upstream_name("missing", &[], &configured),
+        Err("unknown upstream server: missing; available Lua names: my_server".into())
+    );
+}
+
+#[test]
 fn empty_to_empty_is_no_op() {
     let diff = diff_upstreams(&[], &[]);
     assert!(diff.is_empty());

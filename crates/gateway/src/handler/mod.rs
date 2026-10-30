@@ -170,37 +170,47 @@ impl GatewayHandler {
     }
 }
 
+fn unavailable_upstream_message(lua_name: &str, configured: &[UpstreamConfig]) -> String {
+    match crate::reconcile::resolve_upstream_name(lua_name, &[], configured) {
+        Ok(display_name) => format!(
+            "upstream server `{display_name}` (Lua name `{lua_name}`) is configured but unavailable. Call reconnect-upstream with luaServerName `{lua_name}` to retry the connection and obtain its startup diagnostic"
+        ),
+        Err(message) => message,
+    }
+}
+
 impl GatewayHandler {
     /// Look up an upstream by its Lua-sanitized name and wrap the
     /// "not registered" case as a JSON-RPC `invalid_params`.
     ///
     /// Thin adapter over `UpstreamManager::handle_by_lua_name`: the
-    /// manager is the single source of truth for lua_name → handle
-    /// resolution. The handler only adds the "missing upstream is a
-    /// client-visible `invalid_params` error" policy, which is
-    /// specifically a handler-level concern (the manager doesn't know
-    /// about JSON-RPC error shapes).
+    /// manager owns live lua_name → handle resolution. If no live handle
+    /// exists, consult disk config to distinguish an unknown name from a
+    /// configured upstream whose connection failed, and explain how to retry.
+    /// Reconnect itself resolves the configured target under the reload lock
+    /// rather than requiring a live handle here.
     ///
-    /// Used by every tool that takes a `luaServerName` argument plus
-    /// `resources/read`, `resources/subscribe`, and
-    /// `resources/unsubscribe` — seven call sites across the catalog,
-    /// resources, and subscriptions families. Lives in `mod.rs` rather
-    /// than any single family because every family needs it.
+    /// Shared by catalog and resource operations that require a live handle.
     pub(super) async fn require_upstream_by_lua_name(
         &self,
         lua_server_name: &str,
     ) -> Result<Arc<UpstreamHandle>, ErrorData> {
-        self.state
+        if let Some(handle) = self
+            .state
             .ctx
             .upstreams
             .handle_by_lua_name(lua_server_name)
             .await
-            .ok_or_else(|| {
-                ErrorData::invalid_params(
-                    format!("unknown upstream server: {lua_server_name}"),
-                    None,
-                )
-            })
+        {
+            return Ok(handle);
+        }
+        let message = match crate::serve::reload_parse_config() {
+            Ok((configured, _)) => unavailable_upstream_message(lua_server_name, &configured),
+            Err(error) => format!(
+                "upstream server {lua_server_name} is unavailable; could not read configured upstreams: {error:#}. Run reconnect-upstream with luaServerName `{lua_server_name}` after fixing the config"
+            ),
+        };
+        Err(ErrorData::invalid_params(message, None))
     }
 
     /// Internal dispatch body for the `ServerHandler::call_tool` router.
@@ -222,9 +232,10 @@ impl GatewayHandler {
                 let catalog = self.build_server_catalog().await;
                 let entries: Vec<list_servers::CatalogEntry<'_>> = catalog
                     .iter()
-                    .map(|(cfg, hint_opt, health_opt)| {
+                    .map(|(cfg, hint_opt, health_opt, error)| {
                         list_servers::CatalogEntry::new(cfg, hint_opt.as_deref())
                             .with_health(*health_opt)
+                            .with_connection_error(error.as_deref())
                     })
                     .collect();
                 // SystemTime::now() is the only impure bit — passed

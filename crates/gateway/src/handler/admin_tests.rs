@@ -1,4 +1,26 @@
 use super::{render_reconnect_report, render_reload_report};
+
+#[test]
+fn configured_unavailable_message_points_to_exact_reconnect_argument() {
+    let cfg = mcp_client::UpstreamConfig::new(
+        "example-server",
+        "example_server",
+        mcp_client::UpstreamKind::Stdio {
+            command: "missing-command".into(),
+            args: vec![],
+            env: Default::default(),
+        },
+    );
+    let message = super::super::unavailable_upstream_message("example_server", &[cfg]);
+    assert_eq!(
+        message,
+        "upstream server `example-server` (Lua name `example_server`) is configured but unavailable. Call reconnect-upstream with luaServerName `example_server` to retry the connection and obtain its startup diagnostic"
+    );
+    assert_eq!(
+        super::super::unavailable_upstream_message("missing", &[]),
+        "unknown upstream server: missing; available Lua names: "
+    );
+}
 use crate::AppContext;
 use crate::serve::DiffOutcome;
 use mcp_client::{SamplingBroker, UpstreamConfig, UpstreamEventBus, UpstreamKind, UpstreamManager};

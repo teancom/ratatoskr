@@ -62,6 +62,40 @@ async fn make_handle(name: &str, lua_name: &str) -> (ServerHolder, Arc<UpstreamH
 }
 
 #[tokio::test]
+async fn successful_replacements_clear_connection_diagnostics() {
+    // Property: manual replacement and retry success cannot retain obsolete errors.
+    let manager = UpstreamManager::new();
+    let (_server1, first) = make_handle("recovering", "recovering").await;
+    let cfg = first.config.clone();
+    manager.set_configured(vec![cfg.clone()]).await;
+    manager.register(first).await;
+    manager.record_connection_error(&cfg, "first failure").await;
+    let (_server2, second) = make_handle("recovering", "recovering").await;
+    manager
+        .replace("recovering", second)
+        .await
+        .expect("replacement");
+    assert_eq!(manager.connection_error("recovering").await, None);
+    manager.record_connection_error(&cfg, "retry failed").await;
+    let (_server3, third) = make_handle("recovering", "recovering").await;
+    manager
+        .register_or_replace("recovering", third)
+        .await
+        .expect("retry swap");
+    assert_eq!(manager.connection_error("recovering").await, None);
+    manager.remove("recovering").await;
+    manager
+        .record_connection_error(&cfg, "bootstrap retry failed")
+        .await;
+    let (_server4, fourth) = make_handle("recovering", "recovering").await;
+    manager
+        .register_or_replace("recovering", fourth)
+        .await
+        .expect("retry insertion");
+    assert_eq!(manager.connection_error("recovering").await, None);
+}
+
+#[tokio::test]
 async fn handle_by_name_returns_none_for_missing_and_some_for_registered() {
     // Property: `handle_by_name` is a straight HashMap lookup against
     // `UpstreamConfig::name`. Missing name → None, registered name →
@@ -70,7 +104,16 @@ async fn handle_by_name_returns_none_for_missing_and_some_for_registered() {
     assert!(manager.handle_by_name("ghost").await.is_none());
 
     let (_server, handle) = make_handle("alpha", "alpha_lua").await;
+    manager.set_configured(vec![handle.config.clone()]).await;
+    manager
+        .record_connection_error(&handle.config, "executable missing")
+        .await;
+    assert_eq!(
+        manager.connection_error("alpha").await.as_deref(),
+        Some("executable missing")
+    );
     manager.register(Arc::clone(&handle)).await;
+    assert_eq!(manager.connection_error("alpha").await, None);
 
     assert!(manager.handle_by_name("ghost").await.is_none());
     let got = manager

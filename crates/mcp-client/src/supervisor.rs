@@ -177,6 +177,8 @@ use crate::upstream::{UpstreamConfig, UpstreamError, UpstreamHandle, UpstreamMan
 ///
 /// The signature mirrors the production [`crate::connect::connect`]
 /// function exactly, so wiring it up at the call site is one line.
+// async_trait adds #[must_use] to an already must-use boxed Future.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait Connector: Send + Sync + 'static {
     async fn connect(
@@ -603,6 +605,11 @@ impl UpstreamSupervisor {
                 );
             }
             Err(e) => {
+                if let Some(manager) = self.manager.upgrade() {
+                    manager
+                        .record_connection_error(&self.config, &e.to_string())
+                        .await;
+                }
                 self.respawn_failure_streak = attempt;
                 warn!(
                     upstream = %self.config.name,

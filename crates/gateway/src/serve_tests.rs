@@ -476,6 +476,83 @@ fn minimal_ctx(manager: Arc<UpstreamManager>) -> AppContext {
 }
 
 #[tokio::test]
+async fn reconnect_parse_and_name_errors_do_not_mutate_registered_upstreams() {
+    // Property: disk errors and invalid targets cannot apply pending removals.
+    let manager = Arc::new(UpstreamManager::new());
+    let (_srv, handle) = make_handle_with_kind(
+        "retained",
+        UpstreamKind::Stdio {
+            command: "/bin/true".into(),
+            args: vec![],
+            env: Default::default(),
+        },
+    )
+    .await;
+    manager.register(handle).await;
+    let ctx = minimal_ctx(Arc::clone(&manager));
+    let configured_before = manager.configured().await;
+    let before = manager
+        .handle_by_name("retained")
+        .await
+        .expect("registered");
+    let (_, result) = reconcile_from_disk_inner(&ctx, Default::default(), Some("retained"), || {
+        Err(anyhow::anyhow!("invalid disk config fixture"))
+    })
+    .await
+    .expect("parse errors are reported");
+    match result {
+        ReconcileResult::ParseError(message) => assert_eq!(message, "invalid disk config fixture"),
+        ReconcileResult::Applied { .. } => panic!("must not apply invalid disk config"),
+    }
+    assert_eq!(manager.configured().await, configured_before);
+    let error = reconcile_from_disk_inner(&ctx, Default::default(), Some("unknown"), || {
+        Ok((vec![], config::GatewaySettings::default()))
+    })
+    .await
+    .err()
+    .expect("unknown target rejected");
+    assert_eq!(
+        error,
+        "unknown upstream server: unknown; available Lua names: retained"
+    );
+    assert!(Arc::ptr_eq(
+        &before,
+        &manager
+            .handle_by_name("retained")
+            .await
+            .expect("still registered")
+    ));
+}
+
+#[tokio::test]
+async fn reconnect_configured_only_target_returns_connection_diagnostic() {
+    // Property: a failed initial upstream reaches the connection path without a live handle.
+    let manager = Arc::new(UpstreamManager::new());
+    let ctx = minimal_ctx(Arc::clone(&manager));
+    let cfg = stdio_config("failed-startup", "/nonexistent/ratatoskr-test-command");
+    let (target, result) =
+        reconcile_from_disk_inner(&ctx, Default::default(), Some("failed_startup"), || {
+            Ok((vec![cfg], config::GatewaySettings::default()))
+        })
+        .await
+        .expect("configured target resolves");
+    assert_eq!(target.as_deref(), Some("failed-startup"));
+    match result {
+        ReconcileResult::Applied { outcome, .. } => {
+            assert!(outcome.connected.is_empty());
+            assert_eq!(outcome.failed.len(), 1);
+            assert_eq!(outcome.failed[0].0, "failed-startup");
+            assert!(
+                !outcome.failed[0].1.is_empty(),
+                "connection error is surfaced"
+            );
+        }
+        ReconcileResult::ParseError(message) => panic!("unexpected parse error: {message}"),
+    }
+    assert!(manager.list().await.is_empty());
+}
+
+#[tokio::test]
 async fn apply_diff_added_upstream_connects_and_registers() {
     let manager = Arc::new(UpstreamManager::new());
     let ctx = minimal_ctx(Arc::clone(&manager));

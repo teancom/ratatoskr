@@ -47,6 +47,36 @@ impl UpstreamDiff {
     }
 }
 
+/// Resolve a Lua name across configured and live upstreams. Derive names with
+/// the runtime sanitizer; cached `lua_name` fields are not a second naming policy.
+/// A display name present in both snapshots denotes the same upstream.
+pub fn resolve_upstream_name(
+    lua_name: &str,
+    current: &[UpstreamConfig],
+    configured: &[UpstreamConfig],
+) -> Result<String, String> {
+    let mut candidates = std::collections::BTreeSet::new();
+    let mut available = std::collections::BTreeSet::new();
+    for cfg in configured.iter().chain(current) {
+        let sanitized = lua_runtime::sanitize_lua_identifier(&cfg.name);
+        if sanitized == lua_name {
+            candidates.insert(cfg.name.clone());
+        }
+        available.insert(sanitized);
+    }
+    match candidates.len() {
+        0 => Err(format!(
+            "unknown upstream server: {lua_name}; available Lua names: {}",
+            available.into_iter().collect::<Vec<_>>().join(", ")
+        )),
+        1 => Ok(candidates.into_iter().next().expect("one candidate")),
+        _ => Err(format!(
+            "ambiguous upstream server: {lua_name}; display names {} sanitize to the same Lua name; rename an upstream in the config before retrying",
+            candidates.into_iter().collect::<Vec<_>>().join(", ")
+        )),
+    }
+}
+
 /// Classify each upstream into added / removed / changed / unchanged by
 /// comparing the running set against the freshly-parsed one. Pure: the
 /// inputs are owned slices, the output is owned, no side effects.

@@ -96,9 +96,10 @@ impl GatewayHandler {
         UpstreamConfig,
         Option<String>,
         Option<mcp_client::HealthSnapshot>,
+        Option<String>,
     )> {
         // Snapshot the config list — cheap `Vec<UpstreamConfig>` clone.
-        let configs = self.state.ctx.upstreams.list().await;
+        let configs = self.state.ctx.upstreams.configured().await;
         let mut catalog = Vec::with_capacity(configs.len());
         for config in configs {
             let (hint_string, health) =
@@ -114,11 +115,17 @@ impl GatewayHandler {
                     // it). Fall back to the config-only path so an
                     // authored override still shows — the user wrote that
                     // hint for a reason, and absence of a live handle
-                    // shouldn't silence it. Health stays None; the
-                    // renderer prints no health tag in that case.
+                    // shouldn't silence it. Health stays None so the
+                    // renderer identifies the entry as disconnected.
                     None => (hint::resolve_hint(config.hint.as_deref(), None), None),
                 };
-            catalog.push((config, hint_string, health));
+            let error = self
+                .state
+                .ctx
+                .upstreams
+                .connection_error(&config.name)
+                .await;
+            catalog.push((config, hint_string, health, error));
         }
         catalog
     }
