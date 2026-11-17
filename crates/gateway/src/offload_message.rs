@@ -76,6 +76,21 @@ fn top_level_summary(shape: &Shape) -> String {
     }
 }
 
+/// Encode a Lua short string without relying on JSON's incompatible Unicode escapes.
+fn lua_string_literal(value: &str) -> String {
+    let mut quoted = String::from("\"");
+    for ch in value.chars() {
+        match ch {
+            '\"' => quoted.push_str("\\\""),
+            '\\' => quoted.push_str("\\\\"),
+            ch if ch.is_ascii_control() => quoted.push_str(&format!("\\{:03}", ch as u32)),
+            ch => quoted.push(ch),
+        }
+    }
+    quoted.push('\"');
+    quoted
+}
+
 fn retrieval_snippet(execution_id: &str, shape: &Shape) -> String {
     let fetch_line = format!("  local data = _gateway.get_result({{ id = \"{execution_id}\" }})\n");
 
@@ -113,7 +128,13 @@ fn retrieval_snippet(execution_id: &str, shape: &Shape) -> String {
             } else {
                 s.push_str("  result({\n");
                 for k in &sample {
-                    s.push_str(&format!("    {k} = data.{k},\n"));
+                    let identifier = lua_runtime::sanitize_lua_identifier(k) == *k;
+                    if identifier {
+                        s.push_str(&format!("    {k} = data.{k},\n"));
+                    } else {
+                        let quoted = lua_string_literal(k);
+                        s.push_str(&format!("    [{quoted}] = data[{quoted}],\n"));
+                    }
                 }
                 s.push_str("  })\n");
             }

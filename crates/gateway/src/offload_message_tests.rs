@@ -1,5 +1,48 @@
 use super::*;
 
+#[tokio::test]
+async fn object_examples_preserve_keys_that_are_not_lua_identifiers() {
+    use std::sync::Arc;
+    for key in [
+        "a-b",
+        "end",
+        "space key",
+        "é",
+        "",
+        "a\"b",
+        "line\nkey",
+        "control\u{1}key",
+    ] {
+        let store = crate::execution_result_store::ExecutionResultStore::new();
+        let payload = serde_json::json!({key: "sentinel"});
+        let id = store.save("s", payload.to_string()).expect("save object");
+        let shape = Shape::Object {
+            fields: vec![(key.to_string(), Shape::String)],
+        };
+        let script = retrieval_snippet(&id, &shape);
+        let outcome = lua_runtime::LuaRuntime::new()
+            .execute(
+                script,
+                Arc::new(mcp_client::UpstreamManager::new()),
+                None,
+                None,
+                Some(lua_runtime::OffloadConfig {
+                    threshold_bytes: 0,
+                    backend: store.backend_for_session("s"),
+                }),
+                tokio_util::sync::CancellationToken::new(),
+            )
+            .await
+            .expect("suggested script executes");
+        match outcome {
+            lua_runtime::ExecutionOutcome::Direct(value) => {
+                assert_eq!(value, payload, "key={key:?}")
+            }
+            other => panic!("expected inline object, got {other:?}"),
+        }
+    }
+}
+
 #[test]
 fn headline_names_size_and_shape() {
     let s = Shape::Array {
