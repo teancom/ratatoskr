@@ -96,6 +96,70 @@ async fn redaction_marker_expansion_remains_bounded() {
 }
 
 #[test]
+fn control_removal_cannot_reconstruct_sensitive_diagnostics() {
+    let secret = "synthetic-opaque-välue";
+    let secrets = vec![secret.to_string()];
+    for (boundary, _) in secret.char_indices().skip(1) {
+        for control in (0..=0x9f)
+            .filter_map(char::from_u32)
+            .filter(|c| c.is_control() && *c != '\t')
+        {
+            let line = format!("{}{}{}", &secret[..boundary], control, &secret[boundary..]);
+            assert!(
+                !redact(&line, &secrets).contains(secret),
+                "boundary {boundary}, control {control:?}"
+            );
+        }
+    }
+    for line in [
+        "pass\u{1b}word=hunter2",
+        "https:/\u{1b}/user:pass@example.com",
+    ] {
+        assert_eq!(
+            redact(line, &[]),
+            "[credential-bearing stderr line redacted]"
+        );
+    }
+    assert_eq!(
+        redact("opaque\u{1b}value", &["opaque\u{1b}value".to_string()]),
+        "[credential-bearing stderr line redacted]"
+    );
+    assert_eq!(
+        redact("ordinary\u{1b} diagnostic\ttext", &[]),
+        "ordinary diagnostic\ttext"
+    );
+}
+
+#[tokio::test]
+async fn both_diagnostic_paths_hide_secrets_reconstructed_by_control_removal() {
+    let secret = "synthetic-opaque-value";
+    let line = "synthetic-opaque-\u{1b}value";
+    let (reader, mut writer) = tokio::io::duplex(1024);
+    let mut capture = StartupStderr::spawn(reader);
+    writer
+        .write_all(line.as_bytes())
+        .await
+        .expect("write interrupted secret");
+    drop(writer);
+    let captured = capture.diagnostic(&[secret.to_string()]).await;
+    assert!(!captured.contains(secret));
+    assert_eq!(captured, "[credential-bearing stderr line redacted]");
+
+    let config = crate::UpstreamConfig::new(
+        "launcher",
+        "launcher",
+        crate::UpstreamKind::Stdio {
+            command: "launcher".to_string(),
+            args: vec![],
+            env: std::collections::HashMap::from([("VALUE".to_string(), secret.to_string())]),
+        },
+    );
+    let diagnostic = connection_diagnostic(&config, line);
+    assert!(!diagnostic.contains(secret));
+    assert_eq!(diagnostic, "[credential-bearing stderr line redacted]");
+}
+
+#[test]
 fn credential_lines_are_omitted_without_hiding_launcher_hint() {
     let secrets = vec!["opaque-config-value".to_string()];
     for line in [

@@ -135,18 +135,24 @@ fn sensitive_name(name: &str) -> bool {
 }
 
 fn redact(line: &str, secrets: &[String]) -> String {
-    if sensitive_name(line)
-        || secrets
-            .iter()
-            .any(|secret| !secret.is_empty() && line.contains(secret))
-        || (line.contains("://") && (line.contains('@') || line.contains('?')))
-    {
+    // Control removal can join separated fragments into a secret, sensitive
+    // field name, or credential-bearing URL. Check both forms: raw secrets can
+    // themselves contain controls and must not be missed by sanitizing first.
+    let sanitized: String = line
+        .chars()
+        .filter(|c| !c.is_control() || *c == '\t')
+        .collect();
+    let sensitive = |text: &str| {
+        sensitive_name(text)
+            || secrets
+                .iter()
+                .any(|secret| !secret.is_empty() && text.contains(secret))
+            || (text.contains("://") && (text.contains('@') || text.contains('?')))
+    };
+    if sensitive(line) || sensitive(&sanitized) {
         "[credential-bearing stderr line redacted]".to_string()
     } else {
-        // Strip terminal control characters, including escape sequences' ESC.
-        line.chars()
-            .filter(|c| !c.is_control() || *c == '\t')
-            .collect()
+        sanitized
     }
 }
 
