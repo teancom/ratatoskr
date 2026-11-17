@@ -37,7 +37,9 @@
 //! the upstream has nothing registered, or a zombie subscription still
 //! streaming us updates after the last downstream session has gone.
 
-use std::sync::Arc;
+use std::{future::Future, sync::Arc};
+
+use tokio::sync::Mutex;
 
 use mcp_client::{
     UpstreamManager, resource_uri,
@@ -133,11 +135,18 @@ pub enum UnsubscribeError {
 /// Service that owns the ref-counted subscription state machine plus
 /// the upstream fan-out policy.
 ///
-/// Cheap to clone — both fields are `Arc`.
+/// Cheap to clone — registry, upstreams, and transaction guard are shared.
+///
+/// Transactions serialize registry mutation, upstream RPC, and rollback,
+/// including session teardown. A task owns each admitted transaction so
+/// dropping its caller cannot leave an optimistic mutation uncommitted.
+/// The service-wide guard also orders multi-key session cleanup; unrelated
+/// keys wait for each other's RPCs rather than requiring per-key lock ordering.
 #[derive(Clone)]
 pub struct SubscriptionService {
     registry: Arc<SubscriptionRegistry>,
     upstreams: Arc<UpstreamManager>,
+    transactions: Arc<Mutex<()>>,
 }
 
 impl SubscriptionService {
@@ -145,6 +154,28 @@ impl SubscriptionService {
         Self {
             registry,
             upstreams,
+            transactions: Arc::new(Mutex::new(())),
+        }
+    }
+
+    async fn transaction<T, F, Fut>(&self, operation: F) -> T
+    where
+        T: Send + 'static,
+        F: FnOnce(Self) -> Fut + Send + 'static,
+        Fut: Future<Output = T> + Send + 'static,
+    {
+        // Cancellation while queued does not admit a mutation. Once admitted,
+        // the task owns the guard through RPC completion and any rollback.
+        let guard = self.transactions.clone().lock_owned().await;
+        let service = self.clone();
+        let task = tokio::spawn(async move {
+            let _guard = guard;
+            operation(service).await
+        });
+        match task.await {
+            Ok(result) => result,
+            Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
+            Err(error) => panic!("subscription transaction task cancelled: {error}"),
         }
     }
 
@@ -158,6 +189,19 @@ impl SubscriptionService {
     /// `resources/subscribe`; subsequent subscribers just bump the ref
     /// count.
     pub async fn subscribe(
+        &self,
+        session_id: &str,
+        namespaced_uri: &str,
+    ) -> Result<(), SubscribeError> {
+        let session_id = session_id.to_owned();
+        let namespaced_uri = namespaced_uri.to_owned();
+        self.transaction(move |service| async move {
+            service.subscribe_inner(&session_id, &namespaced_uri).await
+        })
+        .await
+    }
+
+    async fn subscribe_inner(
         &self,
         session_id: &str,
         namespaced_uri: &str,
@@ -193,6 +237,21 @@ impl SubscriptionService {
         session_id: &str,
         namespaced_uri: &str,
     ) -> Result<(), UnsubscribeError> {
+        let session_id = session_id.to_owned();
+        let namespaced_uri = namespaced_uri.to_owned();
+        self.transaction(move |service| async move {
+            service
+                .unsubscribe_inner(&session_id, &namespaced_uri)
+                .await
+        })
+        .await
+    }
+
+    async fn unsubscribe_inner(
+        &self,
+        session_id: &str,
+        namespaced_uri: &str,
+    ) -> Result<(), UnsubscribeError> {
         let (lua_name, upstream_uri) =
             resource_uri::decode(namespaced_uri).map_err(|source| UnsubscribeError::DecodeUri {
                 uri: namespaced_uri.to_string(),
@@ -221,6 +280,14 @@ impl SubscriptionService {
     /// entry point so "when rmcp closes a session, what also needs to
     /// go?" has one answer.
     pub async fn drop_session(&self, session_id: &str) {
+        let session_id = session_id.to_owned();
+        self.transaction(move |service| async move {
+            service.drop_session_inner(&session_id).await;
+        })
+        .await;
+    }
+
+    async fn drop_session_inner(&self, session_id: &str) {
         let orphaned_concrete = self.registry.drop_session(session_id);
         let orphaned_templates = self.registry.drop_session_templates(session_id);
         self.teardown_concrete(session_id, orphaned_concrete).await;
