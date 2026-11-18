@@ -45,18 +45,21 @@
 // the matcher URI-native means it composes with any future
 // encoding scheme rather than hard-coding the current one.
 //
-// Invariant
-// ---------
-// Match-expand roundtrip: for any Level 1-2 template T and any
-// valid param map P, `matches(T, expand(T, P))` is true, and
-// `bind(T, expand(T, P))` returns a map that expands to the same
-// URI. The roundtrip test covers this against the `uri-template`
-// crate's expander so we don't re-derive what "correct" means.
+// Invariant and scope bounds
+// --------------------------
+// Captures respect complete percent triplets and simple captures decode as
+// UTF-8. Repeated names denote one scalar, including across operator kinds.
+// Literals remain verbatim; empty captures and adjacent variables remain
+// unsupported. Matching is bounded to 2,000,000 suffix cells and 4,000,000
+// charged work units; exhaustion returns no match, so completeness is not
+// promised outside those limits. See `template_matcher_search` for accounting.
 
 use thiserror::Error;
 
-/// A compiled Level 1-2 template, ready for matching. Construct via
-/// [`CompiledTemplate::compile`].
+#[path = "template_matcher_search.rs"]
+mod search;
+
+/// A compiled Level 1-2 template, ready for matching.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompiledTemplate {
     parts: Vec<Part>,
@@ -64,23 +67,13 @@ pub struct CompiledTemplate {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Part {
-    /// A literal string segment. Matched verbatim.
+    /// A literal segment, matched verbatim.
     Literal(String),
-    /// A Level-1 variable: `{name}`. In expansion, matches any
-    /// percent-encoded value that doesn't include a character from
-    /// the reserved set. For the matching direction we capture a
-    /// maximal run of characters stopping before the next literal.
+    /// A nonempty percent-encoded scalar without raw reserved characters.
     SimpleVar(String),
-    /// A Level-2 reserved-character variable: `{+name}`. Semantically
-    /// identical to `SimpleVar` for matching purposes — both capture
-    /// a character run bounded by the next literal. The distinction
-    /// matters only on the EXPANSION side (percent-encoding reserved
-    /// chars), which is not this module's job.
+    /// A nonempty scalar allowing reserved characters and intact triplets.
     ReservedVar(String),
-    /// A Level-2 fragment variable: `{#name}`. The `#` in the
-    /// expansion is emitted as a literal `#` before the value;
-    /// captured region runs to end-of-URI. At most one per template
-    /// per RFC 6570, always last.
+    /// A final nonempty reserved scalar preceded by a literal '#'.
     FragmentVar(String),
 }
 
@@ -134,11 +127,9 @@ impl CompiledTemplate {
                     break;
                 }
                 Some(0) => {
-                    // Already at '{'; parse the expression.
                     let end = remaining
                         .find('}')
                         .ok_or(CompileError::UnterminatedExpression)?;
-                    // slice between '{' and '}'
                     let expr = &remaining[1..end];
                     if expr.is_empty() {
                         return Err(CompileError::EmptyExpression);
@@ -168,12 +159,14 @@ impl CompiledTemplate {
     }
 
     /// Does `uri` match this template?
+    ///
+    /// Highly ambiguous repeated-name searches can exhaust the bounded work
+    /// allowance and return false; no partial or inconsistent match is returned.
     pub fn matches(&self, uri: &str) -> bool {
         self.try_bind(uri).is_some()
     }
 
-    /// Match `uri` against the template and return the captured
-    /// variable bindings. Returns `None` if the URI doesn't match.
+    /// Return nonempty captured bindings, or `None` on mismatch or work exhaustion.
     pub fn bind(&self, uri: &str) -> Option<Bindings> {
         self.try_bind(uri).map(|values| Bindings { values })
     }
@@ -203,105 +196,7 @@ impl CompiledTemplate {
     }
 
     fn try_bind(&self, uri: &str) -> Option<std::collections::HashMap<String, String>> {
-        let mut values = std::collections::HashMap::new();
-        let mut cursor = uri;
-        let parts = &self.parts;
-
-        for (idx, part) in parts.iter().enumerate() {
-            match part {
-                Part::Literal(lit) => {
-                    if !cursor.starts_with(lit.as_str()) {
-                        return None;
-                    }
-                    cursor = &cursor[lit.len()..];
-                }
-                Part::SimpleVar(name) => {
-                    // RFC 6570 Level-1 expansion percent-encodes reserved
-                    // characters (`/`, `?`, `#`, etc.), so a `/` in the
-                    // concrete URI at a Level-1 variable position means
-                    // the URI was NOT produced by expanding this template.
-                    // We refuse to capture across reserved characters —
-                    // the capture runs until the next literal OR the
-                    // first reserved byte, whichever is sooner.
-                    let next_literal = parts[idx + 1..].iter().find_map(|p| match p {
-                        Part::Literal(s) => Some(s.as_str()),
-                        _ => None,
-                    });
-                    let stop = match next_literal {
-                        Some(lit) => cursor.find(lit),
-                        None => None,
-                    };
-                    // Scan for the first reserved byte; if it comes
-                    // before `stop`, it's the hard boundary.
-                    let reserved_stop = cursor.find(is_reserved_char);
-                    let end = match (stop, reserved_stop) {
-                        (Some(a), Some(b)) => a.min(b),
-                        (Some(a), None) => a,
-                        (None, Some(b)) => b,
-                        (None, None) => cursor.len(),
-                    };
-                    let captured = &cursor[..end];
-                    // If the stopping point was NOT the next literal,
-                    // the URI doesn't match: either we hit reserved
-                    // chars where none were allowed, or we ran out of
-                    // URI before a required literal.
-                    if let Some(lit) = next_literal
-                        && !cursor[end..].starts_with(lit)
-                    {
-                        return None;
-                    }
-                    if captured.is_empty() {
-                        return None;
-                    }
-                    values.insert(name.clone(), captured.to_string());
-                    cursor = &cursor[end..];
-                }
-                Part::ReservedVar(name) => {
-                    // Level-2 `{+var}` allows reserved characters in
-                    // the expansion, so the capture runs last-occurrence /
-                    // maximal until the literal boundary, with no
-                    // reserved-char stop. We use `rfind` (rightmost
-                    // occurrence) rather than `find` so that when the
-                    // separator literal appears more than once in the
-                    // URI the variable absorbs the maximal prefix —
-                    // e.g. `{+path}/v2` over `api/v2/endpoint/v2`
-                    // binds `path = "api/v2/endpoint"`, not `path = "api"`.
-                    let next_literal = parts[idx + 1..].iter().find_map(|p| match p {
-                        Part::Literal(s) => Some(s.as_str()),
-                        _ => None,
-                    });
-                    let (captured, rest) = match next_literal {
-                        Some(lit) => {
-                            let idx = cursor.rfind(lit)?;
-                            (&cursor[..idx], &cursor[idx..])
-                        }
-                        None => (cursor, ""),
-                    };
-                    if captured.is_empty() {
-                        return None;
-                    }
-                    values.insert(name.clone(), captured.to_string());
-                    cursor = rest;
-                }
-                Part::FragmentVar(name) => {
-                    // Fragment is "# + rest of URI". The expansion
-                    // always emits `#` as a literal before the
-                    // value, so matching requires the URI to
-                    // contain a `#` here.
-                    let rest = cursor.strip_prefix('#')?;
-                    if rest.is_empty() {
-                        return None;
-                    }
-                    values.insert(name.clone(), rest.to_string());
-                    cursor = "";
-                }
-            }
-        }
-        if cursor.is_empty() {
-            Some(values)
-        } else {
-            None
-        }
+        search::bind(&self.parts, uri)
     }
 }
 
@@ -386,21 +281,33 @@ fn is_varname_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || c == '_' || c == '.'
 }
 
-/// RFC 6570 "reserved" set: characters that Level-1 expansion
-/// percent-encodes. A Level-1 `{var}` capture must not cross any of
-/// them — if we see one in the URI, either the concrete URI wasn't
-/// produced by this template or the author wanted Level-2 semantics
-/// (`{+var}`).
-///
-/// Kept narrow on purpose: the strict RFC set is
-/// `gen-delims / sub-delims`. Listing them here is cheap documentation.
+/// RFC 6570 gen-delims / sub-delims, forbidden raw in simple captures.
 fn is_reserved_char(c: char) -> bool {
     matches!(
         c,
-        ':' | '/' | '?' | '#' | '[' | ']' | '@' // gen-delims
-        | '!' | '$' | '&' | '\'' | '(' | ')' | '*' | '+' | ',' | ';' | '=' // sub-delims
+        ':' | '/'
+            | '?'
+            | '#'
+            | '['
+            | ']'
+            | '@'
+            | '!'
+            | '$'
+            | '&'
+            | '\''
+            | '('
+            | ')'
+            | '*'
+            | '+'
+            | ','
+            | ';'
+            | '='
     )
 }
+
+#[cfg(test)]
+#[path = "template_matcher_repair_tests.rs"]
+mod repair_tests;
 
 #[cfg(test)]
 #[path = "template_matcher_tests.rs"]
