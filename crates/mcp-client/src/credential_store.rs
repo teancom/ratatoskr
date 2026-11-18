@@ -47,35 +47,65 @@ pub const STATE_DIR_ENV: &str = "RATO_STATE_DIR";
 #[derive(Debug, Clone)]
 pub struct FileCredentialStore {
     path: PathBuf,
+    upstream_name: String,
+    legacy_path: Option<PathBuf>,
+    legacy_cleared: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+const STORAGE_VERSION: u32 = 2;
+// 200 hex bytes + .json leaves room below a 255-byte component limit for
+// atomic-writer suffixes. Reject rather than truncate distinct identities.
+const MAX_NAME_BYTES: usize = 100;
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct CredentialEnvelope {
+    version: u32,
+    upstream_name: String,
+    credentials: StoredCredentials,
 }
 
 impl FileCredentialStore {
     /// Construct a store targeting an explicit file path. Used by tests
     /// and by [`Self::for_upstream`]; production callers normally go
     /// through `for_upstream`.
-    pub fn new(path: PathBuf) -> Self {
-        Self { path }
+    pub fn new(path: PathBuf, upstream_name: &str) -> Self {
+        Self {
+            path,
+            upstream_name: upstream_name.to_string(),
+            legacy_path: None,
+            legacy_cleared: Default::default(),
+        }
     }
 
-    /// Resolve the credential file for `upstream_name` under `state_dir`,
-    /// returning a store bound to `<state_dir>/credentials/<encoded-name>.json`.
+    fn validate_name(&self) -> Result<(), AuthError> {
+        if self.upstream_name.len() > MAX_NAME_BYTES {
+            return Err(AuthError::InternalError(format!(
+                "credential upstream name exceeds {MAX_NAME_BYTES} UTF-8 bytes; choose a shorter upstream name and re-run `login`"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Bind an upstream to `credentials-v2/<lowercase-hex-UTF8>.json`.
+    /// Names are byte-exact, including case and Unicode normalization. Load and
+    /// save reject names longer than 100 UTF-8 bytes to bound filename length.
     ///
-    /// The display name is percent-encoded into a safe, stable, collision-free
-    /// filename component — upstream names can legally contain spaces, slashes,
-    /// and other characters illegal or ambiguous in a path segment. Encoding
-    /// (rather than sanitizing-by-replacement) guarantees two distinct names
-    /// never collide on one file.
-    ///
-    /// This does NOT create the directory or file — that happens lazily on the
-    /// first `save()`, so a `load()` against a never-logged-in upstream simply
-    /// sees a missing file and returns `Ok(None)` without touching the
-    /// filesystem layout.
+    /// Legacy files have no trustworthy identity and are never imported or
+    /// read. Their presence causes an explicit relogin error, not fallback.
+    /// `clear()` acknowledges relogin for this store and its clones, touching
+    /// only the new path; `save()` always writes only the new format.
     pub fn for_upstream(state_dir: &Path, upstream_name: &str) -> Self {
         let encoded = encode_filename(upstream_name);
         let path = state_dir
-            .join("credentials")
+            .join("credentials-v2")
             .join(format!("{encoded}.json"));
-        Self::new(path)
+        let mut store = Self::new(path, upstream_name);
+        store.legacy_path = Some(
+            state_dir
+                .join("credentials")
+                .join(format!("{}.json", legacy_encode_filename(upstream_name))),
+        );
+        store
     }
 
     /// The on-disk path this store reads and writes. Exposed so the
@@ -118,11 +148,19 @@ pub fn state_dir() -> Option<PathBuf> {
     state_dir_with_env(|k| std::env::var_os(k))
 }
 
-/// Percent-encode an upstream display name into a single safe filename
-/// component. We encode everything outside an unreserved allowlist
-/// (`A-Z a-z 0-9 - _ .`), which collapses spaces, slashes, and any other
-/// path-significant or shell-significant character into `%XX` escapes.
+/// Lowercase hex preserves byte identity under filesystem casefolding and
+/// Unicode normalization. No input characters are emitted literally.
 fn encode_filename(name: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(name.len() * 2);
+    for byte in name.bytes() {
+        encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+        encoded.push(char::from(HEX[usize::from(byte & 15)]));
+    }
+    encoded
+}
+
+fn legacy_encode_filename(name: &str) -> String {
     use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 
     // Start from "encode everything non-alphanumeric", then carve out the
@@ -136,19 +174,43 @@ fn encode_filename(name: &str) -> String {
 #[async_trait::async_trait]
 impl CredentialStore for FileCredentialStore {
     async fn load(&self) -> Result<Option<StoredCredentials>, AuthError> {
+        self.validate_name()?;
         match tokio::fs::read(&self.path).await {
             Ok(bytes) => {
-                let creds = serde_json::from_slice::<StoredCredentials>(&bytes).map_err(|e| {
-                    AuthError::InternalError(format!(
-                        "credential file {} is corrupt or schema-incompatible: {e}; \
-                         delete it and re-run `login`",
-                        self.path.display()
-                    ))
-                })?;
-                Ok(Some(creds))
+                let envelope =
+                    serde_json::from_slice::<CredentialEnvelope>(&bytes).map_err(|_| {
+                        AuthError::InternalError(format!(
+                            "credential file {} is corrupt or schema-incompatible; re-run `login`",
+                            self.path.display()
+                        ))
+                    })?;
+                if envelope.version != STORAGE_VERSION
+                    || envelope.upstream_name != self.upstream_name
+                {
+                    return Err(AuthError::InternalError(
+                        "credential identity or storage version mismatch; refusing credentials; re-run `login`".to_string()
+                    ));
+                }
+                Ok(Some(envelope.credentials))
             }
-            // Missing file is the normal "never logged in" case — not an error.
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                if !self
+                    .legacy_cleared
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                    && let Some(legacy) = &self.legacy_path
+                {
+                    match tokio::fs::symlink_metadata(legacy).await {
+                        Ok(_) => return Err(AuthError::InternalError(
+                            "legacy credentials require explicit migration: identity cannot be verified; re-run `login` for this upstream to save fresh versioned credentials; legacy files are preserved and never imported".to_string()
+                        )),
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {},
+                        Err(_) => return Err(AuthError::InternalError(
+                            "unable to inspect legacy credential path; check permissions and re-run `login`".to_string()
+                        )),
+                    }
+                }
+                Ok(None)
+            }
             Err(e) => Err(AuthError::InternalError(format!(
                 "failed to read credential file {}: {e}",
                 self.path.display()
@@ -157,7 +219,13 @@ impl CredentialStore for FileCredentialStore {
     }
 
     async fn save(&self, credentials: StoredCredentials) -> Result<(), AuthError> {
-        let bytes = serde_json::to_vec_pretty(&credentials).map_err(|e| {
+        self.validate_name()?;
+        let envelope = CredentialEnvelope {
+            version: STORAGE_VERSION,
+            upstream_name: self.upstream_name.clone(),
+            credentials,
+        };
+        let bytes = serde_json::to_vec_pretty(&envelope).map_err(|e| {
             AuthError::InternalError(format!("failed to serialize credentials: {e}"))
         })?;
         write_atomic_0600(&self.path, &bytes)
@@ -166,6 +234,9 @@ impl CredentialStore for FileCredentialStore {
     }
 
     async fn clear(&self) -> Result<(), AuthError> {
+        self.validate_name()?;
+        self.legacy_cleared
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         match tokio::fs::remove_file(&self.path).await {
             Ok(()) => Ok(()),
             // Already gone is success — `clear` is idempotent.

@@ -15,6 +15,37 @@ fn sample_creds(client_id: &str) -> StoredCredentials {
 }
 
 #[tokio::test]
+async fn case_variant_names_keep_independent_credentials() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let upper = FileCredentialStore::for_upstream(dir.path(), "A");
+    let lower = FileCredentialStore::for_upstream(dir.path(), "a");
+    upper.save(sample_creds("first")).await.expect("save A");
+    lower.save(sample_creds("second")).await.expect("save a");
+    assert_eq!(
+        upper
+            .load()
+            .await
+            .expect("load A")
+            .expect("present")
+            .client_id,
+        "first"
+    );
+    assert_eq!(
+        lower
+            .load()
+            .await
+            .expect("load a")
+            .expect("present")
+            .client_id,
+        "second"
+    );
+    assert_ne!(
+        upper.path().to_string_lossy().to_lowercase(),
+        lower.path().to_string_lossy().to_lowercase()
+    );
+}
+
+#[tokio::test]
 async fn save_then_load_round_trips() {
     let dir = tempfile::tempdir().expect("tempdir");
     let store = FileCredentialStore::for_upstream(dir.path(), "Datadog-Acme");
@@ -118,6 +149,108 @@ async fn concurrent_saves_never_yield_a_torn_read() {
     writer.await.expect("writer joined");
 }
 
+#[tokio::test]
+async fn identity_and_version_mismatches_fail_closed() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let a = FileCredentialStore::for_upstream(dir.path(), "A");
+    let b = FileCredentialStore::new(a.path().to_path_buf(), "a");
+    a.save(sample_creds("synthetic-sensitive-client"))
+        .await
+        .expect("save");
+    for store in [&b, &a] {
+        if store.upstream_name == "A" {
+            let mut envelope: CredentialEnvelope =
+                serde_json::from_slice(&tokio::fs::read(a.path()).await.expect("read fixture"))
+                    .expect("envelope");
+            envelope.version = 99;
+            tokio::fs::write(
+                a.path(),
+                serde_json::to_vec(&envelope).expect("serialize fixture"),
+            )
+            .await
+            .expect("tamper version");
+        }
+        match store.load().await.expect_err("reject mismatched envelope") {
+            AuthError::InternalError(message) => assert_eq!(
+                message,
+                "credential identity or storage version mismatch; refusing credentials; re-run `login`"
+            ),
+            other => panic!("expected internal error, got {other:?}"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn legacy_only_requires_relogin_without_reading_or_deleting_legacy() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = FileCredentialStore::for_upstream(dir.path(), "A");
+    let legacy = store.legacy_path.as_ref().expect("legacy path");
+    tokio::fs::create_dir_all(legacy.parent().expect("parent"))
+        .await
+        .expect("mkdir");
+    let original = b"synthetic unparseable legacy fixture";
+    tokio::fs::write(legacy, original)
+        .await
+        .expect("write fixture");
+    match store.load().await.expect_err("explicit migration required") {
+        AuthError::InternalError(message) => assert_eq!(
+            message,
+            "legacy credentials require explicit migration: identity cannot be verified; re-run `login` for this upstream to save fresh versioned credentials; legacy files are preserved and never imported"
+        ),
+        other => panic!("expected internal error, got {other:?}"),
+    }
+    store.clear().await.expect("clear new path only");
+    assert!(
+        store
+            .load()
+            .await
+            .expect("acknowledged fresh login")
+            .is_none()
+    );
+    store.save(sample_creds("fresh")).await.expect("fresh save");
+    let reopened = FileCredentialStore::for_upstream(dir.path(), "A");
+    assert_eq!(
+        reopened
+            .load()
+            .await
+            .expect("load new")
+            .expect("present")
+            .client_id,
+        "fresh"
+    );
+    assert_eq!(
+        tokio::fs::read(legacy).await.expect("legacy preserved"),
+        original
+    );
+}
+
+#[tokio::test]
+async fn filename_byte_limit_is_explicit_and_accepts_boundary() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let valid = FileCredentialStore::for_upstream(dir.path(), &"é".repeat(50));
+    valid
+        .save(sample_creds("boundary"))
+        .await
+        .expect("100 UTF-8 bytes supported");
+    assert_eq!(valid.path().file_name().expect("filename").len(), 205);
+    let invalid = FileCredentialStore::for_upstream(dir.path(), &"a".repeat(101));
+    for error in [
+        invalid.load().await.expect_err("oversize load"),
+        invalid
+            .save(sample_creds("x"))
+            .await
+            .expect_err("oversize save"),
+    ] {
+        match error {
+            AuthError::InternalError(message) => assert_eq!(
+                message,
+                "credential upstream name exceeds 100 UTF-8 bytes; choose a shorter upstream name and re-run `login`"
+            ),
+            other => panic!("expected internal error, got {other:?}"),
+        }
+    }
+}
+
 #[test]
 fn state_dir_prefers_override() {
     let dir = state_dir_with_env(|k| match k {
@@ -156,8 +289,17 @@ fn filenames_are_encoded_and_collision_free() {
     assert_ne!(a.path(), b.path());
     assert_ne!(a.path(), c.path());
     assert_ne!(b.path(), c.path());
-    // The legible common case stays readable.
-    assert!(c.path().to_string_lossy().ends_with("Datadog-Acme.json"));
+    assert_eq!(encode_filename("A"), "41");
+    assert_eq!(encode_filename("a"), "61");
+    let names = ["A", "a", "%41", "é", "e\u{301}", "/", ".", "", "a/b"];
+    for (i, name) in names.iter().enumerate() {
+        for other in &names[i + 1..] {
+            assert_ne!(
+                encode_filename(name).to_lowercase(),
+                encode_filename(other).to_lowercase()
+            );
+        }
+    }
     // No path separators leak into the encoded component.
     let a_name = a
         .path()
