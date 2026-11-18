@@ -438,11 +438,7 @@ impl UpstreamHealth {
             .store(now_micros(), Ordering::Release);
 
         if kind.is_transport_level() {
-            // `fetch_add` returns the PREVIOUS value; add 1 to get the
-            // new one so callers can compare against the threshold
-            // without off-by-one guessing.
-            let previous = self.consecutive_failures.fetch_add(1, Ordering::AcqRel);
-            Some(previous.saturating_add(1))
+            Some(saturating_increment(&self.consecutive_failures))
         } else {
             None
         }
@@ -483,10 +479,7 @@ impl UpstreamHealth {
                 .store(1, Ordering::Release);
             1
         } else {
-            let previous = self
-                .consecutive_self_reported_errors
-                .fetch_add(1, Ordering::AcqRel);
-            previous.saturating_add(1)
+            saturating_increment(&self.consecutive_self_reported_errors)
         }
     }
 
@@ -600,6 +593,18 @@ impl UpstreamHealth {
             last_success_at,
             last_failure_at,
             consecutive_self_reported_errors,
+        }
+    }
+}
+
+/// Atomically increment a counter without allowing it to wrap.
+fn saturating_increment(counter: &AtomicU32) -> u32 {
+    let mut current = counter.load(Ordering::Acquire);
+    loop {
+        let next = current.saturating_add(1);
+        match counter.compare_exchange_weak(current, next, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => return next,
+            Err(observed) => current = observed,
         }
     }
 }

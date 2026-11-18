@@ -340,23 +340,10 @@ fn consecutive_counter_saturates_rather_than_wrapping() {
         .store(u32::MAX - 1, Ordering::Release);
     // First increment: lands on MAX, record_failure returns MAX.
     assert_eq!(h.record_failure(FailureKind::CallTimeout), Some(u32::MAX));
-    // Second: saturates at MAX (fetch_add wraps, then
-    // saturating_add clamps the returned value).
-    //
-    // NOTE: `fetch_add` on AtomicU32 itself DOES wrap — it's
-    // `wrapping_add` under the hood. The saturation here lives in
-    // the returned value via `saturating_add(1)`. So after this
-    // second call, the *stored* counter is 0 (wrapped), which
-    // would in principle allow Suspect → Healthy demotion on a
-    // subsequent success.
-    //
-    // Realistically, u32::MAX consecutive transport failures
-    // means the upstream is dead and the supervisor has long
-    // since moved on, so this wrap isn't a live failure mode.
-    // Pinning the *returned* value saturates is the contract
-    // callers rely on for logging and threshold checks; the
-    // underlying store wrap is a documented limitation.
+    // Further increments preserve the stored counter and return value
+    // at the ceiling.
     assert_eq!(h.record_failure(FailureKind::CallTimeout), Some(u32::MAX));
+    assert_eq!(h.consecutive_failures(), u32::MAX);
 }
 
 // ---- record_self_reported_error / decay tests ----
@@ -516,4 +503,73 @@ fn snapshot_surfaces_self_reported_counter() {
         snap.last_failure_kind,
         FailureKind::UpstreamSelfReportedError
     );
+}
+
+#[test]
+fn consecutive_failures_saturate_in_storage_and_return_value() {
+    // Property: reaching u32::MAX keeps both the logged value and the
+    // stored health counter at MAX instead of wrapping to zero.
+    let h = UpstreamHealth::new();
+    h.consecutive_failures
+        .store(u32::MAX - 1, Ordering::Release);
+
+    assert_eq!(h.record_failure(FailureKind::CallTimeout), Some(u32::MAX));
+    assert_eq!(h.consecutive_failures(), u32::MAX);
+    assert_eq!(h.record_failure(FailureKind::CallTimeout), Some(u32::MAX));
+    assert_eq!(h.consecutive_failures(), u32::MAX);
+}
+
+#[test]
+fn self_reported_errors_saturate_and_refresh_decay_timestamp() {
+    // Property: a fresh self-reported signal at the counter ceiling is
+    // retained as MAX, and its timestamp starts the next decay interval.
+    let h = UpstreamHealth::new();
+    h.consecutive_self_reported_errors
+        .store(u32::MAX - 1, Ordering::Release);
+    h.last_self_reported_micros
+        .store(now_micros().saturating_sub(1_000_000), Ordering::Release);
+
+    assert_eq!(h.record_self_reported_error(), u32::MAX);
+    assert_eq!(h.consecutive_self_reported_errors(), u32::MAX);
+    let recorded_at = h.last_self_reported_micros.load(Ordering::Acquire);
+    assert!(recorded_at > 0);
+    assert!(now_micros().saturating_sub(recorded_at) < SELF_REPORT_DECAY.as_micros() as i64);
+
+    assert_eq!(h.record_self_reported_error(), u32::MAX);
+    assert_eq!(h.consecutive_self_reported_errors(), u32::MAX);
+}
+
+#[test]
+fn concurrent_counter_updates_saturate_near_max() {
+    // Property: racing increments at the boundary cannot wrap either
+    // streak counter or return a value below the saturated maximum.
+    const THREADS: usize = 8;
+    const INCREMENTS: usize = 32;
+
+    let h = UpstreamHealth::new();
+    h.consecutive_failures
+        .store(u32::MAX - 1, Ordering::Release);
+    h.consecutive_self_reported_errors
+        .store(u32::MAX - 1, Ordering::Release);
+    h.last_self_reported_micros
+        .store(now_micros(), Ordering::Release);
+
+    std::thread::scope(|scope| {
+        let mut joins = Vec::new();
+        for _ in 0..THREADS {
+            let h = &h;
+            joins.push(scope.spawn(move || {
+                for _ in 0..INCREMENTS {
+                    assert_eq!(h.record_failure(FailureKind::CallTimeout), Some(u32::MAX));
+                    assert_eq!(h.record_self_reported_error(), u32::MAX);
+                }
+            }));
+        }
+        for join in joins {
+            join.join().expect("counter update thread must complete");
+        }
+    });
+
+    assert_eq!(h.consecutive_failures(), u32::MAX);
+    assert_eq!(h.consecutive_self_reported_errors(), u32::MAX);
 }
