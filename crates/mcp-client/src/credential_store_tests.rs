@@ -90,6 +90,34 @@ async fn no_tmp_file_left_after_save() {
 }
 
 #[tokio::test]
+async fn simultaneous_saves_have_independent_temporary_files() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut store = FileCredentialStore::for_upstream(dir.path(), "svc");
+    store.publish_barrier = Some(std::sync::Arc::new(tokio::sync::Barrier::new(2)));
+    let (first, second) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        tokio::join!(
+            store.save(sample_creds("first")),
+            store.save(sample_creds("second"))
+        )
+    })
+    .await
+    .expect("both saves reach publication without sleeps");
+    first.expect("first save publishes its own temporary file");
+    second.expect("second save publishes its own temporary file");
+    let loaded = store.load().await.expect("load").expect("present");
+    assert!(["first", "second"].contains(&loaded.client_id.as_str()));
+    let mut entries = tokio::fs::read_dir(store.path().parent().expect("parent"))
+        .await
+        .expect("read directory");
+    let mut count = 0;
+    while let Some(entry) = entries.next_entry().await.expect("entry") {
+        assert!(!entry.file_name().to_string_lossy().contains(".tmp."));
+        count += 1;
+    }
+    assert_eq!(count, 1);
+}
+
+#[tokio::test]
 async fn concurrent_saves_never_yield_a_torn_read() {
     let dir = tempfile::tempdir().expect("tempdir");
     let store = FileCredentialStore::for_upstream(dir.path(), "svc");
