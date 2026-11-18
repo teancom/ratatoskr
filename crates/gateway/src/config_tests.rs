@@ -908,6 +908,44 @@ fn effective_supervision_rejects_invalid_per_upstream_merge() {
 }
 
 #[test]
+fn supervision_backoff_hour_limit_applies_to_global_and_upstream_settings() {
+    // Property: neither configuration scope can bypass the one-hour ceiling.
+    for cap in [3_600_000u64, 3_600_001, u64::MAX] {
+        let global = format!(
+            r#"{{"upstreamSupervision":{{"respawnBackoffCapMs":{cap}}},"mcpClients":{{}}}}"#
+        );
+        if cap == 3_600_000 {
+            parse_full(&global).expect("one-hour global cap");
+        } else {
+            match parse_full(&global).expect_err("global cap above one hour") {
+                ConfigError::InvalidSupervision(source) => {
+                    assert_eq!(source, SupervisionError::BackoffCapExceedsOneHour)
+                }
+                other => panic!("expected InvalidSupervision, got {other:?}"),
+            }
+        }
+        let local = format!(
+            r#"{{"mcpClients":{{"limited":{{"type":"stdio","command":"x","supervision":{{"respawnBackoffCapMs":{cap}}}}}}}}}"#
+        );
+        let parsed = parse_full(&local).expect("upstream validation occurs after merge");
+        let effective = parsed
+            .settings
+            .effective_supervision_for(&parsed.upstreams[0]);
+        if cap == 3_600_000 {
+            effective.expect("one-hour upstream cap");
+        } else {
+            match effective.expect_err("upstream cap above one hour") {
+                ConfigError::InvalidUpstreamSupervision { name, source } => {
+                    assert_eq!(name, "limited");
+                    assert_eq!(source, SupervisionError::BackoffCapExceedsOneHour);
+                }
+                other => panic!("expected InvalidUpstreamSupervision, got {other:?}"),
+            }
+        }
+    }
+}
+
+#[test]
 fn effective_supervision_no_per_upstream_overrides_returns_baseline() {
     // Property: an upstream with no `supervision` key inherits
     // exactly the gateway-wide settings. No re-validation work

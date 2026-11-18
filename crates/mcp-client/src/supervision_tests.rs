@@ -1,6 +1,35 @@
 use super::*;
 
 #[test]
+fn respawn_backoff_cap_must_not_exceed_one_hour() {
+    let hour = Duration::from_secs(3600);
+    let settings = SupervisionSettings {
+        respawn_backoff_base: hour,
+        respawn_backoff_cap: hour,
+        ..Default::default()
+    };
+    settings.validate().expect("exactly one hour is allowed");
+    for attempt in [0, 1, 2, 33, 34, 35, u32::MAX] {
+        assert_eq!(settings.respawn_delay(attempt), hour);
+    }
+    for cap in [
+        hour + Duration::from_nanos(1),
+        hour + Duration::from_millis(1),
+        Duration::MAX,
+    ] {
+        let settings = SupervisionSettings {
+            respawn_backoff_cap: cap,
+            ..Default::default()
+        };
+        assert_eq!(
+            settings.validate(),
+            Err(SupervisionError::BackoffCapExceedsOneHour),
+            "cap {cap:?}"
+        );
+    }
+}
+
+#[test]
 fn default_settings_are_self_consistent() {
     // Property: the built-in defaults pass validation. Regression
     // guard: if someone changes a default to a value that breaks

@@ -195,6 +195,9 @@ impl SupervisionSettings {
                 interval_ms: self.active_ping_interval.as_millis() as u64,
             });
         }
+        if self.respawn_backoff_cap > Duration::from_secs(3600) {
+            return Err(SupervisionError::BackoffCapExceedsOneHour);
+        }
         if self.respawn_backoff_base > self.respawn_backoff_cap {
             return Err(SupervisionError::BackoffBaseExceedsCap {
                 base_ms: self.respawn_backoff_base.as_millis() as u64,
@@ -277,6 +280,9 @@ pub enum SupervisionError {
          respawnBackoffCapMs ({cap_ms})"
     )]
     BackoffBaseExceedsCap { base_ms: u64, cap_ms: u64 },
+
+    #[error("respawnBackoffCapMs must not exceed 3600000 (one hour)")]
+    BackoffCapExceedsOneHour,
 
     #[error(
         "callTimeoutMs must be greater than zero; a zero deadline \
