@@ -47,6 +47,8 @@ pub const STATE_DIR_ENV: &str = "RATO_STATE_DIR";
 #[derive(Debug, Clone)]
 pub struct FileCredentialStore {
     path: PathBuf,
+    #[cfg(test)]
+    publish_barrier: Option<std::sync::Arc<tokio::sync::Barrier>>,
 }
 
 impl FileCredentialStore {
@@ -54,7 +56,11 @@ impl FileCredentialStore {
     /// and by [`Self::for_upstream`]; production callers normally go
     /// through `for_upstream`.
     pub fn new(path: PathBuf) -> Self {
-        Self { path }
+        Self {
+            path,
+            #[cfg(test)]
+            publish_barrier: None,
+        }
     }
 
     /// Resolve the credential file for `upstream_name` under `state_dir`,
@@ -160,9 +166,14 @@ impl CredentialStore for FileCredentialStore {
         let bytes = serde_json::to_vec_pretty(&credentials).map_err(|e| {
             AuthError::InternalError(format!("failed to serialize credentials: {e}"))
         })?;
-        write_atomic_0600(&self.path, &bytes)
-            .await
-            .map_err(|e| AuthError::InternalError(format!("{e}")))
+        write_atomic_0600(
+            &self.path,
+            &bytes,
+            #[cfg(test)]
+            self.publish_barrier.as_ref(),
+        )
+        .await
+        .map_err(|e| AuthError::InternalError(format!("{e}")))
     }
 
     async fn clear(&self) -> Result<(), AuthError> {
@@ -181,15 +192,19 @@ impl CredentialStore for FileCredentialStore {
 /// Atomically write `bytes` to `path` with `0600` permissions, creating the
 /// parent directory `0700` if needed.
 ///
-/// Strategy: write to `<path>.tmp.<pid>` in the same directory (same-filesystem
+/// Strategy: reserve `<path>.tmp.<pid>.<sequence>` exclusively in the same directory (same-filesystem
 /// guarantee for an atomic rename), fsync the data, then `rename` over the
 /// target. A reader either sees the complete old file or the complete new one —
 /// never a torn write. The temp file carries the `0600` mode from creation, so
 /// the secret is never world-readable even transiently.
 ///
-/// The `.tmp.<pid>` suffix keeps two concurrent writers (e.g. a refresh racing
-/// a re-login) from clobbering each other's temp file before either renames.
-async fn write_atomic_0600(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+/// The sequence separates same-process writers; `create_new` protects existing
+/// files even after PID reuse. Publishing is last-writer-wins, never a torn file.
+async fn write_atomic_0600(
+    path: &Path,
+    bytes: &[u8],
+    #[cfg(test)] publish_barrier: Option<&std::sync::Arc<tokio::sync::Barrier>>,
+) -> std::io::Result<()> {
     let parent = path.parent().ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -204,37 +219,49 @@ async fn write_atomic_0600(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| "credentials.json".to_string());
-    let tmp_path = parent.join(format!("{file_name}.tmp.{pid}"));
-
-    // Write + fsync + set mode on the temp file. Done in spawn_blocking
-    // because the create-with-mode dance uses std's OpenOptionsExt and a
-    // blocking fsync; keeping it off the async reactor avoids stalling it
-    // and sidesteps tokio::fs's lack of a create-with-mode primitive.
-    let tmp_for_blocking = tmp_path.clone();
+    let parent = parent.to_path_buf();
     let bytes_owned = bytes.to_vec();
-    let write_result = tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+    // Exclusive creation reserves a private file even across concurrent saves,
+    // PID reuse, stale files, or counter wrap. Never truncate a preexisting path.
+    let tmp_path = tokio::task::spawn_blocking(move || -> std::io::Result<PathBuf> {
         use std::io::Write;
-
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
         let mut opts = std::fs::OpenOptions::new();
-        opts.write(true).create(true).truncate(true);
+        opts.write(true).create_new(true);
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
             opts.mode(0o600);
         }
-        let mut file = opts.open(&tmp_for_blocking)?;
-        file.write_all(&bytes_owned)?;
-        file.sync_all()?;
-        Ok(())
+        for _ in 0..1024 {
+            let sequence = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
+            let tmp = parent.join(format!("{file_name}.tmp.{pid}.{sequence}"));
+            let mut file = match opts.open(&tmp) {
+                Ok(file) => file,
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(e),
+            };
+            if let Err(e) = file.write_all(&bytes_owned).and_then(|()| file.sync_all()) {
+                drop(file);
+                let _ = std::fs::remove_file(&tmp);
+                return Err(e);
+            }
+            return Ok(tmp);
+        }
+        Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "unable to reserve a unique credential temporary file",
+        ))
     })
     .await
-    .map_err(|e| std::io::Error::other(format!("credential write task panicked: {e}")))?;
+    .map_err(|e| std::io::Error::other(format!("credential write task panicked: {e}")))??;
 
-    if let Err(e) = write_result {
-        // Best-effort cleanup of the temp file on write failure so we don't
-        // leak `.tmp.<pid>` droppings.
-        let _ = tokio::fs::remove_file(&tmp_path).await;
-        return Err(e);
+    // Tests hold both real saves after fsync, making publication races
+    // deterministic without changing production scheduling.
+    #[cfg(test)]
+    if let Some(barrier) = publish_barrier {
+        barrier.wait().await;
     }
 
     // Atomic publish. On failure, clean up the temp file.
